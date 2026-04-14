@@ -1,9 +1,10 @@
 const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
 const { Schema } = mongoose;
 
 // ── User (team + clients) ────────────────────────────────────
 const UserSchema = new Schema({
-  email:        { type: String, required: true, unique: true, lowercase: true },
+  email:        { type: String, required: true, unique: true, lowercase: true, trim: true },
   passwordHash: { type: String, required: true },
   role:         { type: String, enum: ['team', 'client'], required: true },
   name:         { type: String, required: true },
@@ -12,6 +13,16 @@ const UserSchema = new Schema({
   teamRole:     String, // 'Creative Director', 'Editor', etc.
   clientId:     { type: Schema.Types.ObjectId, ref: 'Client' }, // for portal users
 }, { timestamps: true });
+
+UserSchema.pre("validate", function (next) {
+  if (this.role === "client" && !this.clientId) {
+    this.invalidate("clientId", "Client users must have a linked clientId");
+  }
+  if (this.role === "team") {
+    this.clientId = undefined;
+  }
+  next();
+});
 
 // ── Client ────────────────────────────────────────────────────
 const ClientSchema = new Schema({
@@ -28,7 +39,7 @@ const ClientSchema = new Schema({
   welcomeMessage: String,
   // Portal
   portalPassword: String, // hashed
-  portalEmail:    String,
+  portalEmail:    { type: String, trim: true, lowercase: true },
   // Shoot
   shoot: {
     name:     String,
@@ -54,6 +65,47 @@ const ClientSchema = new Schema({
     zichtbaarInPortaal: { type: Boolean, default: false },
   }
 }, { timestamps: true });
+
+function isBcryptHash(value) {
+  return typeof value === "string" && /^\$2[aby]\$\d{2}\$/.test(value);
+}
+
+async function hashClientPortalPassword(rawValue) {
+  if (typeof rawValue !== "string") return rawValue;
+  const trimmed = rawValue.trim();
+  if (!trimmed) return undefined;
+  if (isBcryptHash(trimmed)) return trimmed;
+  return bcrypt.hash(trimmed, 10);
+}
+
+ClientSchema.pre("save", async function (next) {
+  if (!this.isModified("portalPassword")) return next();
+  this.portalPassword = await hashClientPortalPassword(this.portalPassword);
+  next();
+});
+
+async function hashPortalPasswordInUpdate(next) {
+  const update = this.getUpdate();
+  if (!update) return next();
+
+  const hasTopLevel = Object.prototype.hasOwnProperty.call(update, "portalPassword");
+  const hasSetLevel =
+    update.$set && Object.prototype.hasOwnProperty.call(update.$set, "portalPassword");
+  if (!hasTopLevel && !hasSetLevel) return next();
+
+  if (hasTopLevel) {
+    update.portalPassword = await hashClientPortalPassword(update.portalPassword);
+  }
+  if (hasSetLevel) {
+    update.$set.portalPassword = await hashClientPortalPassword(update.$set.portalPassword);
+  }
+
+  this.setUpdate(update);
+  next();
+}
+
+ClientSchema.pre("findOneAndUpdate", hashPortalPasswordInUpdate);
+ClientSchema.pre("updateOne", hashPortalPasswordInUpdate);
 
 // ── Event ─────────────────────────────────────────────────────
 const EventSchema = new Schema({

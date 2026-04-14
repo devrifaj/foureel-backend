@@ -7,6 +7,19 @@ const { seedTeamUsers } = require("../utils/seedTeamUsers");
 
 const router = express.Router();
 
+const COOKIE_OPTIONS = {
+  httpOnly: true,
+  secure: process.env.NODE_ENV === "production",
+  sameSite: "lax",
+  maxAge: 7 * 24 * 60 * 60 * 1000,
+};
+
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
 const sign = (user) =>
   jwt.sign(
     { id: user._id, role: user.role, name: user.name, clientId: user.clientId },
@@ -14,23 +27,85 @@ const sign = (user) =>
     { expiresIn: "7d" },
   );
 
+async function verifyPassword(inputPassword, storedHashOrLegacyValue) {
+  try {
+    const bcryptMatch = await bcrypt.compare(inputPassword, storedHashOrLegacyValue);
+    if (bcryptMatch) return true;
+  } catch {
+    // Ignore invalid hash formats and continue with legacy fallback.
+  }
+  return (
+    typeof storedHashOrLegacyValue === "string" &&
+    storedHashOrLegacyValue === inputPassword
+  );
+}
+
 // POST /api/auth/login
 router.post("/login", async (req, res) => {
   try {
-    const { email, password } = req.body;
-    const user = await User.findOne({ email: email.toLowerCase() });
-    if (!user) return res.status(401).json({ error: "Invalid credentials" });
+    const rawEmail = req.body?.email;
+    const rawPassword = typeof req.body?.password === "string" ? req.body.password : "";
+    const email = normalizeEmail(rawEmail);
+    const password = rawPassword.trim();
+    if (!email || !password || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: "Email and password are required" });
+    }
 
-    const match = await bcrypt.compare(password, user.passwordHash);
-    if (!match) return res.status(401).json({ error: "Invalid credentials" });
+    let user = await User.findOne({ email });
+    let legacyClient = null;
+
+    // Backward compatibility:
+    // allow client login using either portalEmail or the client's contact email.
+    if (!user) {
+      legacyClient = await Client.findOne({
+        $or: [{ portalEmail: email }, { email }],
+      });
+
+      // If a portal user already exists for this client, validate against it first.
+      if (legacyClient) {
+        user = await User.findOne({ clientId: legacyClient._id, role: "client" });
+        if (user) {
+          const existingUserMatch = await verifyPassword(password, user.passwordHash);
+          if (!existingUserMatch) {
+            return res.status(401).json({ error: "Invalid credentials" });
+          }
+        }
+      }
+    }
+
+    // Backward-compatibility migration path:
+    // if a portal User record doesn't exist yet, authenticate from hashed Client.portalPassword once,
+    // then create the proper User document.
+    if (!user) {
+      legacyClient = legacyClient || (await Client.findOne({ portalEmail: email }));
+      if (!legacyClient || !legacyClient.portalPassword) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      const legacyMatch = await verifyPassword(password, legacyClient.portalPassword);
+      if (!legacyMatch) {
+        return res.status(401).json({ error: "Invalid credentials" });
+      }
+
+      user = await User.create({
+        email,
+        passwordHash: await bcrypt.hash(password, 10),
+        role: "client",
+        name: legacyClient.name,
+        clientId: legacyClient._id,
+      });
+
+      if (legacyClient.portalPassword) {
+        legacyClient.portalPassword = undefined;
+        await legacyClient.save();
+      }
+    } else {
+      const match = await verifyPassword(password, user.passwordHash);
+      if (!match) return res.status(401).json({ error: "Invalid credentials" });
+    }
 
     const token = sign(user);
-    res.cookie("token", token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
-    });
+    res.cookie("token", token, COOKIE_OPTIONS);
 
     // If client, load their data
     let clientData = null;
@@ -55,7 +130,7 @@ router.post("/login", async (req, res) => {
 
 // POST /api/auth/logout
 router.post("/logout", (req, res) => {
-  res.clearCookie("token");
+  res.clearCookie("token", COOKIE_OPTIONS);
   res.json({ message: "Logged out" });
 });
 

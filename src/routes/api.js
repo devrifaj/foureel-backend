@@ -13,6 +13,28 @@ const {
 const auth = require("../middleware/auth");
 
 const router = express.Router();
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const TASK_COLUMNS = ["todo", "bezig", "review", "klaar"];
+const BCRYPT_HASH_REGEX = /^\$2[aby]\$\d{2}\$/;
+
+function normalizeEmail(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isValidPortalPassword(password) {
+  return typeof password === "string" && password.trim().length >= 8;
+}
+
+function hasOwn(obj, key) {
+  return Object.prototype.hasOwnProperty.call(obj, key);
+}
+
+async function ensureClientPortalPasswordHashed(clientDoc) {
+  if (!clientDoc?.portalPassword) return;
+  if (BCRYPT_HASH_REGEX.test(clientDoc.portalPassword)) return;
+  clientDoc.portalPassword = await bcrypt.hash(String(clientDoc.portalPassword), 10);
+  await clientDoc.save();
+}
 
 // ── ACTIVITY LOG ─────────────────────────────────────────────
 async function log(text, color, view, user) {
@@ -24,13 +46,19 @@ async function log(text, color, view, user) {
   });
 }
 
+function sanitizeClient(clientDoc) {
+  if (!clientDoc) return clientDoc;
+  const obj = typeof clientDoc.toObject === "function" ? clientDoc.toObject() : clientDoc;
+  return { ...obj, portalPassword: undefined };
+}
+
 // ═══════════════════════════════════════════════════════════════
 // CLIENTS
 // ═══════════════════════════════════════════════════════════════
 router.get("/clients", auth(["team"]), async (req, res) => {
   try {
     const clients = await Client.find().sort({ name: 1 });
-    res.json(clients);
+    res.json(clients.map(sanitizeClient));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -40,7 +68,7 @@ router.get("/clients/:id", auth(["team"]), async (req, res) => {
   try {
     const client = await Client.findById(req.params.id);
     if (!client) return res.status(404).json({ error: "Not found" });
-    res.json(client);
+    res.json(sanitizeClient(client));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -48,16 +76,68 @@ router.get("/clients/:id", auth(["team"]), async (req, res) => {
 
 router.post("/clients", auth(["team"]), async (req, res) => {
   try {
-    const client = await Client.create(req.body);
-    // Create portal user if email + portalPassword provided
-    if (req.body.portalEmail && req.body.portalPassword) {
-      await User.create({
-        email: req.body.portalEmail,
-        passwordHash: await bcrypt.hash(req.body.portalPassword, 10),
-        role: "client",
-        name: client.name,
-        clientId: client._id,
+    if (!req.body?.name?.trim()) {
+      return res.status(400).json({ error: "Client name is required" });
+    }
+
+    const normalizedPortalEmail = normalizeEmail(req.body.portalEmail);
+    const rawPortalPassword =
+      typeof req.body.portalPassword === "string" ? req.body.portalPassword.trim() : "";
+    const hasPortalEmail = Boolean(normalizedPortalEmail);
+    const hasPortalPassword = Boolean(rawPortalPassword);
+    const hashedPortalPassword = hasPortalPassword
+      ? await bcrypt.hash(rawPortalPassword, 10)
+      : undefined;
+
+    if (hasPortalEmail !== hasPortalPassword) {
+      return res.status(400).json({
+        error: "Portal email and portal password must both be provided",
       });
+    }
+    if (hasPortalEmail && !EMAIL_REGEX.test(normalizedPortalEmail)) {
+      return res.status(400).json({ error: "Invalid portal email format" });
+    }
+    if (hasPortalPassword && !isValidPortalPassword(rawPortalPassword)) {
+      return res.status(400).json({
+        error: "Portal password must be at least 8 characters",
+      });
+    }
+
+    if (hasPortalEmail) {
+      const exists = await User.findOne({ email: normalizedPortalEmail });
+      if (exists) {
+        return res
+          .status(409)
+          .json({ error: "Portal email is already in use by another account" });
+      }
+    }
+
+    const payload = {
+      ...req.body,
+      portalEmail: hasPortalEmail ? normalizedPortalEmail : undefined,
+    };
+    delete payload.portalPassword;
+
+    const client = await Client.create({
+      ...payload,
+      portalPassword: hashedPortalPassword,
+    });
+    await ensureClientPortalPasswordHashed(client);
+
+    // Create portal user if email + portalPassword provided
+    if (hasPortalEmail && hasPortalPassword) {
+      try {
+        await User.create({
+          email: normalizedPortalEmail,
+          passwordHash: hashedPortalPassword,
+          role: "client",
+          name: client.name,
+          clientId: client._id,
+        });
+      } catch (error) {
+        await Client.findByIdAndDelete(client._id);
+        throw error;
+      }
     }
     await log(
       `Nieuwe klant <strong>${client.name}</strong> toegevoegd`,
@@ -65,7 +145,7 @@ router.post("/clients", auth(["team"]), async (req, res) => {
       "klanten",
       req.user.name,
     );
-    res.status(201).json(client);
+    res.status(201).json(sanitizeClient(client));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -73,10 +153,110 @@ router.post("/clients", auth(["team"]), async (req, res) => {
 
 router.put("/clients/:id", auth(["team"]), async (req, res) => {
   try {
-    const client = await Client.findByIdAndUpdate(req.params.id, req.body, {
+    const existingClient = await Client.findById(req.params.id);
+    if (!existingClient) return res.status(404).json({ error: "Not found" });
+    const rawPortalPassword =
+      typeof req.body.portalPassword === "string" ? req.body.portalPassword.trim() : "";
+
+    const hasPortalEmailInPayload = hasOwn(req.body, "portalEmail");
+    const normalizedPortalEmail = hasPortalEmailInPayload
+      ? normalizeEmail(req.body.portalEmail) || ""
+      : existingClient.portalEmail || "";
+    const hasPortalPasswordInPayload = hasOwn(req.body, "portalPassword");
+    const hashedPortalPassword =
+      hasPortalPasswordInPayload && rawPortalPassword
+        ? await bcrypt.hash(rawPortalPassword, 10)
+        : undefined;
+
+    if (hasPortalEmailInPayload && normalizedPortalEmail && !EMAIL_REGEX.test(normalizedPortalEmail)) {
+      return res.status(400).json({ error: "Invalid portal email format" });
+    }
+    if (hasPortalPasswordInPayload && rawPortalPassword && !isValidPortalPassword(rawPortalPassword)) {
+      return res.status(400).json({
+        error: "Portal password must be at least 8 characters",
+      });
+    }
+    if (
+      (hasPortalEmailInPayload && normalizedPortalEmail && !rawPortalPassword && !existingClient.portalEmail) ||
+      (hasPortalPasswordInPayload && rawPortalPassword && !normalizedPortalEmail)
+    ) {
+      return res.status(400).json({
+        error:
+          "Portal email and password are both required to create first-time portal credentials",
+      });
+    }
+
+    if (hasPortalEmailInPayload && normalizedPortalEmail) {
+      const conflict = await User.findOne({
+        email: normalizedPortalEmail,
+        clientId: { $ne: existingClient._id },
+      });
+      if (conflict) {
+        return res
+          .status(409)
+          .json({ error: "Portal email is already in use by another account" });
+      }
+    }
+
+    const updatePayload = {
+      ...req.body,
+    };
+    if (hasPortalPasswordInPayload) {
+      updatePayload.portalPassword = hashedPortalPassword;
+    } else {
+      delete updatePayload.portalPassword;
+    }
+    if (hasPortalEmailInPayload) {
+      updatePayload.portalEmail = normalizedPortalEmail || undefined;
+    }
+
+    const client = await Client.findByIdAndUpdate(req.params.id, updatePayload, {
       new: true,
     });
-    res.json(client);
+    await ensureClientPortalPasswordHashed(client);
+
+    const providedPortalPassword = rawPortalPassword;
+    const shouldUpsertPortalUser =
+      (hasPortalEmailInPayload && normalizedPortalEmail) || !!providedPortalPassword;
+
+    if (hasPortalEmailInPayload && !normalizedPortalEmail) {
+      await User.findOneAndDelete({ clientId: client._id });
+    }
+
+    if (shouldUpsertPortalUser) {
+      const targetEmail = normalizedPortalEmail || client.portalEmail;
+      if (targetEmail) {
+        const existingPortalUser = await User.findOne({ clientId: client._id });
+        const passwordHash = providedPortalPassword
+          ? hashedPortalPassword
+          : existingPortalUser?.passwordHash;
+
+        if (!existingPortalUser) {
+          if (!passwordHash) {
+            return res.status(400).json({
+              error:
+                "A password is required the first time you create portal login credentials",
+            });
+          }
+          await User.create({
+            email: targetEmail,
+            passwordHash,
+            role: "client",
+            name: client.name,
+            clientId: client._id,
+          });
+        } else {
+          existingPortalUser.email = targetEmail;
+          existingPortalUser.name = client.name;
+          if (providedPortalPassword) {
+            existingPortalUser.passwordHash = passwordHash;
+          }
+          await existingPortalUser.save();
+        }
+      }
+    }
+
+    res.json(sanitizeClient(client));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -168,11 +348,47 @@ router.post("/tasks", auth(["team"]), async (req, res) => {
   }
 });
 
+router.patch("/tasks/:id/column", auth(["team"]), async (req, res) => {
+  try {
+    const { column } = req.body || {};
+    if (!TASK_COLUMNS.includes(column)) {
+      return res.status(400).json({ error: "Invalid task column" });
+    }
+
+    const task = await Task.findById(req.params.id);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+
+    if (task.column === column) {
+      return res.json(task);
+    }
+
+    task.column = column;
+    await task.save();
+
+    await log(
+      `<strong>${task.assignee}</strong> taak <strong>${task.title}</strong> naar ${task.column}`,
+      "var(--blue)",
+      "taken",
+      req.user.name,
+    );
+    res.json(task);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 router.put("/tasks/:id", auth(["team"]), async (req, res) => {
   try {
+    if (
+      Object.prototype.hasOwnProperty.call(req.body || {}, "column") &&
+      !TASK_COLUMNS.includes(req.body.column)
+    ) {
+      return res.status(400).json({ error: "Invalid task column" });
+    }
     const task = await Task.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
     });
+    if (!task) return res.status(404).json({ error: "Task not found" });
     if (req.body.column) {
       await log(
         `<strong>${task.assignee}</strong> taak <strong>${task.title}</strong> naar ${task.column}`,
@@ -429,6 +645,9 @@ router.post(
 // ═══════════════════════════════════════════════════════════════
 router.get("/portal/me", auth(["client"]), async (req, res) => {
   try {
+    if (!req.user.clientId) {
+      return res.status(403).json({ error: "Client access requires a linked client account" });
+    }
     const client = await Client.findById(req.user.clientId);
     if (!client) return res.status(404).json({ error: "Client not found" });
 
