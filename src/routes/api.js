@@ -16,6 +16,11 @@ const router = express.Router();
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TASK_COLUMNS = ["todo", "bezig", "review", "klaar"];
 const BCRYPT_HASH_REGEX = /^\$2[aby]\$\d{2}\$/;
+const LT_LANG_MAP = {
+  nl: "nl-NL",
+  en: "en-US",
+  "nl+en": "auto",
+};
 
 function normalizeEmail(value) {
   return typeof value === "string" ? value.trim().toLowerCase() : "";
@@ -29,10 +34,39 @@ function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+async function resolveClientIdFromPayload(payload = {}) {
+  if (payload.clientId) return payload.clientId;
+  const name = typeof payload.client === "string" ? payload.client.trim() : "";
+  if (!name) return undefined;
+  const client = await Client.findOne({ name });
+  return client?._id;
+}
+
+async function resolveTaskClientFields(payload = {}) {
+  const clientId = await resolveClientIdFromPayload(payload);
+  if (clientId) {
+    const clientDoc = await Client.findById(clientId).select("name");
+    return {
+      clientId,
+      client: clientDoc?.name || payload.client || undefined,
+    };
+  }
+  return {
+    clientId: undefined,
+    client:
+      typeof payload.client === "string" && payload.client.trim()
+        ? payload.client.trim()
+        : undefined,
+  };
+}
+
 async function ensureClientPortalPasswordHashed(clientDoc) {
   if (!clientDoc?.portalPassword) return;
   if (BCRYPT_HASH_REGEX.test(clientDoc.portalPassword)) return;
-  clientDoc.portalPassword = await bcrypt.hash(String(clientDoc.portalPassword), 10);
+  clientDoc.portalPassword = await bcrypt.hash(
+    String(clientDoc.portalPassword),
+    10,
+  );
   await clientDoc.save();
 }
 
@@ -48,7 +82,8 @@ async function log(text, color, view, user) {
 
 function sanitizeClient(clientDoc) {
   if (!clientDoc) return clientDoc;
-  const obj = typeof clientDoc.toObject === "function" ? clientDoc.toObject() : clientDoc;
+  const obj =
+    typeof clientDoc.toObject === "function" ? clientDoc.toObject() : clientDoc;
   return { ...obj, portalPassword: undefined };
 }
 
@@ -82,7 +117,9 @@ router.post("/clients", auth(["team"]), async (req, res) => {
 
     const normalizedPortalEmail = normalizeEmail(req.body.portalEmail);
     const rawPortalPassword =
-      typeof req.body.portalPassword === "string" ? req.body.portalPassword.trim() : "";
+      typeof req.body.portalPassword === "string"
+        ? req.body.portalPassword.trim()
+        : "";
     const hasPortalEmail = Boolean(normalizedPortalEmail);
     const hasPortalPassword = Boolean(rawPortalPassword);
     const hashedPortalPassword = hasPortalPassword
@@ -156,7 +193,9 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
     const existingClient = await Client.findById(req.params.id);
     if (!existingClient) return res.status(404).json({ error: "Not found" });
     const rawPortalPassword =
-      typeof req.body.portalPassword === "string" ? req.body.portalPassword.trim() : "";
+      typeof req.body.portalPassword === "string"
+        ? req.body.portalPassword.trim()
+        : "";
 
     const hasPortalEmailInPayload = hasOwn(req.body, "portalEmail");
     const normalizedPortalEmail = hasPortalEmailInPayload
@@ -168,17 +207,30 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
         ? await bcrypt.hash(rawPortalPassword, 10)
         : undefined;
 
-    if (hasPortalEmailInPayload && normalizedPortalEmail && !EMAIL_REGEX.test(normalizedPortalEmail)) {
+    if (
+      hasPortalEmailInPayload &&
+      normalizedPortalEmail &&
+      !EMAIL_REGEX.test(normalizedPortalEmail)
+    ) {
       return res.status(400).json({ error: "Invalid portal email format" });
     }
-    if (hasPortalPasswordInPayload && rawPortalPassword && !isValidPortalPassword(rawPortalPassword)) {
+    if (
+      hasPortalPasswordInPayload &&
+      rawPortalPassword &&
+      !isValidPortalPassword(rawPortalPassword)
+    ) {
       return res.status(400).json({
         error: "Portal password must be at least 8 characters",
       });
     }
     if (
-      (hasPortalEmailInPayload && normalizedPortalEmail && !rawPortalPassword && !existingClient.portalEmail) ||
-      (hasPortalPasswordInPayload && rawPortalPassword && !normalizedPortalEmail)
+      (hasPortalEmailInPayload &&
+        normalizedPortalEmail &&
+        !rawPortalPassword &&
+        !existingClient.portalEmail) ||
+      (hasPortalPasswordInPayload &&
+        rawPortalPassword &&
+        !normalizedPortalEmail)
     ) {
       return res.status(400).json({
         error:
@@ -210,14 +262,19 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
       updatePayload.portalEmail = normalizedPortalEmail || undefined;
     }
 
-    const client = await Client.findByIdAndUpdate(req.params.id, updatePayload, {
-      new: true,
-    });
+    const client = await Client.findByIdAndUpdate(
+      req.params.id,
+      updatePayload,
+      {
+        new: true,
+      },
+    );
     await ensureClientPortalPasswordHashed(client);
 
     const providedPortalPassword = rawPortalPassword;
     const shouldUpsertPortalUser =
-      (hasPortalEmailInPayload && normalizedPortalEmail) || !!providedPortalPassword;
+      (hasPortalEmailInPayload && normalizedPortalEmail) ||
+      !!providedPortalPassword;
 
     if (hasPortalEmailInPayload && !normalizedPortalEmail) {
       await User.findOneAndDelete({ clientId: client._id });
@@ -332,7 +389,11 @@ router.get("/tasks", auth(["team"]), async (req, res) => {
 
 router.get("/tasks/archived", auth(["team"]), async (req, res) => {
   try {
-    const tasks = await Task.find({ archived: true }).sort({ archivedAt: -1 });
+    const filters = { archived: true };
+    if (req.query?.clientId) {
+      filters.clientId = req.query.clientId;
+    }
+    const tasks = await Task.find(filters).sort({ archivedAt: -1 });
     res.json(tasks);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -341,7 +402,11 @@ router.get("/tasks/archived", auth(["team"]), async (req, res) => {
 
 router.post("/tasks", auth(["team"]), async (req, res) => {
   try {
-    const task = await Task.create(req.body);
+    const clientFields = await resolveTaskClientFields(req.body);
+    const task = await Task.create({
+      ...req.body,
+      ...clientFields,
+    });
     res.status(201).json(task);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -385,9 +450,23 @@ router.put("/tasks/:id", auth(["team"]), async (req, res) => {
     ) {
       return res.status(400).json({ error: "Invalid task column" });
     }
-    const task = await Task.findByIdAndUpdate(req.params.id, req.body, {
+    const shouldResolveClient =
+      Object.prototype.hasOwnProperty.call(req.body || {}, "clientId") ||
+      Object.prototype.hasOwnProperty.call(req.body || {}, "client");
+    const resolvedClientFields = shouldResolveClient
+      ? await resolveTaskClientFields(req.body)
+      : {};
+
+    const task = await Task.findByIdAndUpdate(
+      req.params.id,
+      {
+        ...req.body,
+        ...resolvedClientFields,
+      },
+      {
       new: true,
-    });
+      },
+    );
     if (!task) return res.status(404).json({ error: "Task not found" });
     if (req.body.column) {
       await log(
@@ -405,15 +484,23 @@ router.put("/tasks/:id", auth(["team"]), async (req, res) => {
 
 router.post("/tasks/:id/archive", auth(["team"]), async (req, res) => {
   try {
+    const archivedReason =
+      typeof req.body?.archivedReason === "string" && req.body.archivedReason.trim()
+        ? req.body.archivedReason.trim()
+        : typeof req.body?.reason === "string" && req.body.reason.trim()
+          ? req.body.reason.trim()
+          : "manual";
+
     const task = await Task.findByIdAndUpdate(
       req.params.id,
       {
         archived: true,
         archivedAt: new Date(),
-        archiveReason: req.body.reason || "completed",
+        archivedReason,
       },
       { new: true },
     );
+    if (!task) return res.status(404).json({ error: "Task not found" });
     await log(
       `<strong>${req.user.name}</strong> taak <strong>${task.title}</strong> gearchiveerd`,
       "var(--amber)",
@@ -430,9 +517,10 @@ router.post("/tasks/:id/restore", auth(["team"]), async (req, res) => {
   try {
     const task = await Task.findByIdAndUpdate(
       req.params.id,
-      { archived: false, archivedAt: null, column: "todo" },
+      { archived: false, archivedAt: null, archivedReason: null, column: "todo" },
       { new: true },
     );
+    if (!task) return res.status(404).json({ error: "Task not found" });
     res.json(task);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -453,7 +541,11 @@ router.get("/batches", auth(["team"]), async (req, res) => {
 
 router.post("/batches", auth(["team"]), async (req, res) => {
   try {
-    const batch = await Batch.create(req.body);
+    const clientId = await resolveClientIdFromPayload(req.body);
+    const batch = await Batch.create({
+      ...req.body,
+      clientId: clientId || req.body.clientId,
+    });
     res.status(201).json(batch);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -462,9 +554,14 @@ router.post("/batches", auth(["team"]), async (req, res) => {
 
 router.put("/batches/:id", auth(["team"]), async (req, res) => {
   try {
+    const clientId = await resolveClientIdFromPayload(req.body);
     const batch = await Batch.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
     });
+    if (batch && clientId && !batch.clientId) {
+      batch.clientId = clientId;
+      await batch.save();
+    }
     res.json(batch);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -507,14 +604,35 @@ router.put(
 
       // Auto-push to portal when fase = waitreview
       if (req.body.editFase === "waitreview") {
-        const client = await Client.findById(batch.clientId);
+        if (!video.portalPushed) {
+          video.portalPushed = true;
+          video.revision = false;
+          video.revisionNote = "";
+          video.approved = false;
+          video.approvedAt = null;
+          await batch.save();
+        }
+
+        const targetClientId = batch.clientId || (await resolveClientIdFromPayload(batch));
+        const client = targetClientId ? await Client.findById(targetClientId) : null;
         if (client) {
-          await Note.create({
+          const existingPushNote = await Note.findOne({
             clientId: client._id,
             from: "studio",
-            author: "Team · 4REEL",
             text: `Video "${video.name}" staat klaar voor jouw beoordeling.`,
-          });
+          }).sort({ createdAt: -1 });
+          const recentDuplicate =
+            existingPushNote &&
+            Date.now() - new Date(existingPushNote.createdAt).getTime() <
+              60 * 1000;
+          if (!recentDuplicate) {
+            await Note.create({
+              clientId: client._id,
+              from: "studio",
+              author: "Team · 4REEL",
+              text: `Video "${video.name}" staat klaar voor jouw beoordeling.`,
+            });
+          }
           await log(
             `Video <strong>${video.name}</strong> naar klantportaal gestuurd`,
             "var(--accent)",
@@ -646,7 +764,9 @@ router.post(
 router.get("/portal/me", auth(["client"]), async (req, res) => {
   try {
     if (!req.user.clientId) {
-      return res.status(403).json({ error: "Client access requires a linked client account" });
+      return res
+        .status(403)
+        .json({ error: "Client access requires a linked client account" });
     }
     const client = await Client.findById(req.user.clientId);
     if (!client) return res.status(404).json({ error: "Client not found" });
@@ -753,7 +873,11 @@ router.post(
   auth(["client"]),
   async (req, res) => {
     try {
-      const { note } = req.body;
+      const note =
+        typeof req.body?.note === "string" ? req.body.note.trim() : "";
+      if (!note) {
+        return res.status(400).json({ error: "Revision note is required" });
+      }
       const batches = await Batch.find({ clientId: req.user.clientId });
       for (const batch of batches) {
         const video = batch.videos.id(req.params.videoId);
@@ -838,14 +962,31 @@ router.get("/activity", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 router.get("/pulse", auth(["team"]), async (req, res) => {
   try {
-    const [clients, tasks, batches, events] = await Promise.all([
+    const [clients, tasks, archivedTasks, batches, events] = await Promise.all([
       Client.find(),
       Task.find({ archived: false }),
+      Task.find({ archived: true }),
       Batch.find(),
       Event.find(),
     ]);
 
     const now = new Date();
+    const monthLabels = [
+      "jan",
+      "feb",
+      "mrt",
+      "apr",
+      "mei",
+      "jun",
+      "jul",
+      "aug",
+      "sep",
+      "okt",
+      "nov",
+      "dec",
+    ];
+    const thisMonth = now.getMonth();
+    const thisYear = now.getFullYear();
     const allVideos = batches.flatMap((b) => b.videos.map((v) => ({ v, b })));
 
     const pipelineCounts = {};
@@ -860,25 +1001,167 @@ router.get("/pulse", auth(["team"]), async (req, res) => {
       if (!editorLoad[ed]) editorLoad[ed] = { active: 0, reviewing: 0 };
       if (["inprogress", "intern_review"].includes(v.editFase))
         editorLoad[ed].active++;
-      if (["waitreview", "client_review", "feedbackrdy"].includes(v.editFase))
+      if (["inprogress", "waitreview", "client_review", "client_revision"].includes(v.editFase))
         editorLoad[ed].reviewing++;
+    });
+
+    const notStarted =
+      (pipelineCounts.tentative || 0) + (pipelineCounts.spotting || 0);
+    const inEdit = (pipelineCounts.ready || 0) + (pipelineCounts.inprogress || 0);
+    const inReview =
+      (pipelineCounts.waitreview || 0) +
+      (pipelineCounts.client_review || 0) +
+      (pipelineCounts.client_revision || 0) +
+      (pipelineCounts.uploaddrive || 0);
+    const delivered = pipelineCounts.finished || 0;
+
+    const shootsThisMonth = events.filter((e) => {
+      if (e.type !== "Shoot") return false;
+      const dt = new Date(e.date);
+      if (Number.isNaN(dt.getTime())) return false;
+      return dt.getMonth() === thisMonth && dt.getFullYear() === thisYear;
+    }).length;
+
+    const urgentDeadlines = [];
+    batches.forEach((b) => {
+      if (!b.deadline) return;
+      const deadlineDate = new Date(b.deadline);
+      if (Number.isNaN(deadlineDate.getTime())) return;
+      const diffDays = Math.ceil((deadlineDate.getTime() - now.getTime()) / 86400000);
+      if (diffDays < 0 || diffDays > 7) return;
+      const openVideos = (b.videos || []).filter((v) => v.editFase !== "finished").length;
+      if (!openVideos) return;
+      urgentDeadlines.push({
+        name: b.name,
+        client: b.client,
+        days: diffDays,
+        open: openVideos,
+      });
+    });
+
+    const deliveredMonth = archivedTasks.filter((t) => {
+      if (t.archivedReason !== "delivered") return false;
+      const dt = t.archivedAt ? new Date(t.archivedAt) : null;
+      if (!dt || Number.isNaN(dt.getTime())) return false;
+      return dt.getMonth() === thisMonth && dt.getFullYear() === thisYear;
+    }).length;
+
+    const monthlyDelivered = {};
+    for (let i = 5; i >= 0; i -= 1) {
+      const d = new Date(thisYear, thisMonth - i, 1);
+      const key = `${monthLabels[d.getMonth()]} ${d.getFullYear()}`;
+      monthlyDelivered[key] = 0;
+    }
+
+    archivedTasks.forEach((t) => {
+      const dt = t.archivedAt ? new Date(t.archivedAt) : null;
+      if (!dt || Number.isNaN(dt.getTime())) return;
+      const key = `${monthLabels[dt.getMonth()]} ${dt.getFullYear()}`;
+      if (Object.prototype.hasOwnProperty.call(monthlyDelivered, key)) {
+        monthlyDelivered[key] += 1;
+      }
+    });
+
+    allVideos
+      .filter(({ v }) => v.editFase === "finished")
+      .forEach(() => {
+        const key = `${monthLabels[thisMonth]} ${thisYear}`;
+        if (Object.prototype.hasOwnProperty.call(monthlyDelivered, key)) {
+          monthlyDelivered[key] += 1;
+        }
+      });
+
+    const clientStats = clients.map((c) => {
+      const clientBatches = batches.filter((b) => {
+        if (b.clientId && String(b.clientId) === String(c._id)) return true;
+        return b.client && b.client === c.name;
+      });
+      const videoCount = clientBatches.reduce(
+        (sum, b) => sum + ((b.videos && b.videos.length) || 0),
+        0,
+      );
+      return {
+        _id: c._id,
+        name: c.name,
+        urgent: !!c.urgent,
+        batchCount: clientBatches.length,
+        videoCount,
+      };
     });
 
     res.json({
       totalClients: clients.length,
       urgentClients: clients.filter((c) => c.urgent).length,
+      batchesActive: batches.length,
       totalVideos: allVideos.length,
-      inReview:
-        (pipelineCounts.waitreview || 0) + (pipelineCounts.client_review || 0),
-      finished: pipelineCounts.finished || 0,
+      notStarted,
+      inEdit,
+      inReview,
+      finished: delivered,
       inProgress: pipelineCounts.inprogress || 0,
+      shootsThisMonth,
       shootsPlanned: events.filter(
         (e) => e.type === "Shoot" && new Date(e.date) >= now,
       ).length,
+      deliveredMonth,
       openTasks: tasks.filter((t) => t.column !== "klaar").length,
+      monthlyDelivered,
+      clients: clientStats,
       pipelineCounts,
       editorLoad,
+      urgentDeadlines,
     });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// VIDEO CHECKER
+// ═══════════════════════════════════════════════════════════════
+router.post("/checker/analyze", auth(["team"]), async (req, res) => {
+  try {
+    const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+    const language = LT_LANG_MAP[req.body?.language] || "nl-NL";
+    const mode =
+      typeof req.body?.mode === "string" ? req.body.mode : "spelling";
+
+    if (!text) {
+      return res.json({ errors: [] });
+    }
+
+    const params = new URLSearchParams();
+    params.set("text", text);
+    params.set("language", language);
+    params.set("enabledOnly", "false");
+
+    if (mode === "spelling") {
+      params.set("enabledCategories", "TYPOS");
+    } else if (mode === "spelling+grammar") {
+      params.set("enabledCategories", "TYPOS,GRAMMAR");
+    }
+
+    const ltRes = await fetch("https://api.languagetool.org/v2/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: params.toString(),
+    });
+
+    if (!ltRes.ok) {
+      return res.status(502).json({ error: "LanguageTool request failed" });
+    }
+
+    const data = await ltRes.json();
+    const errors = (data.matches || []).map((m) => ({
+      wrong: text.slice(m.offset, m.offset + m.length),
+      suggestion: m.replacements?.[0]?.value || "",
+      message: m.message || "",
+      offset: m.offset,
+      length: m.length,
+      ruleId: m.rule?.id || "",
+    }));
+
+    res.json({ errors });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

@@ -22,7 +22,12 @@ function normalizeEmail(value) {
 
 const sign = (user) =>
   jwt.sign(
-    { id: user._id, role: user.role, name: user.name, clientId: user.clientId },
+    {
+      id: user._id,
+      role: user.role,
+      name: user.name,
+      clientId: user.clientId || null,
+    },
     process.env.JWT_SECRET,
     { expiresIn: "7d" },
   );
