@@ -1,5 +1,8 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
+const { PutObjectCommand } = require("@aws-sdk/client-s3");
+const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const {
   Client,
   Event,
@@ -9,7 +12,14 @@ const {
   Questionnaire,
   Activity,
   User,
+  VideoCheckerRun,
 } = require("../models");
+const s3 = require("../lib/s3");
+const {
+  readAwsCheckerEnv,
+  hasBucketAndRegion,
+  hasSigningCredentials,
+} = require("../config/awsEnv");
 const auth = require("../middleware/auth");
 
 const router = express.Router();
@@ -28,6 +38,34 @@ function normalizeEmail(value) {
 
 function isValidPortalPassword(password) {
   return typeof password === "string" && password.trim().length >= 8;
+}
+
+/** Dev stub until real transactional email is wired up. */
+function logPortalAccessEmailStub(payload) {
+  const {
+    to,
+    clientName,
+    event,
+    changedEmail,
+    changedPassword,
+    previousEmail,
+  } = payload;
+  const parts = [
+    "[PORTAL EMAIL STUB — replace with real mailer]",
+    `To: ${to}`,
+    `Client: ${clientName || "—"}`,
+    `Event: ${event}`,
+  ];
+  if (previousEmail && previousEmail !== to) {
+    parts.push(`Previous login email: ${previousEmail}`);
+  }
+  parts.push(`Login email (after save): ${changedEmail || to}`);
+  parts.push(
+    changedPassword
+      ? "Password: was set or changed (value not logged)."
+      : "Password: unchanged.",
+  );
+  console.log(parts.join("\n"));
 }
 
 function hasOwn(obj, key) {
@@ -175,6 +213,13 @@ router.post("/clients", auth(["team"]), async (req, res) => {
         await Client.findByIdAndDelete(client._id);
         throw error;
       }
+      logPortalAccessEmailStub({
+        to: normalizedPortalEmail,
+        clientName: client.name,
+        event: "portal_credentials_created_with_client",
+        changedEmail: normalizedPortalEmail,
+        changedPassword: true,
+      });
     }
     await log(
       `Nieuwe klant <strong>${client.name}</strong> toegevoegd`,
@@ -302,13 +347,37 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
             name: client.name,
             clientId: client._id,
           });
+          logPortalAccessEmailStub({
+            to: targetEmail,
+            clientName: client.name,
+            event: "portal_credentials_created",
+            changedEmail: targetEmail,
+            changedPassword: true,
+            previousEmail: existingClient.portalEmail || undefined,
+          });
         } else {
+          const prevEmail = existingPortalUser.email;
           existingPortalUser.email = targetEmail;
           existingPortalUser.name = client.name;
           if (providedPortalPassword) {
             existingPortalUser.passwordHash = passwordHash;
           }
           await existingPortalUser.save();
+          const emailChanged =
+            String(prevEmail || "").toLowerCase() !==
+            String(targetEmail || "").toLowerCase();
+          if (emailChanged || providedPortalPassword) {
+            logPortalAccessEmailStub({
+              to: targetEmail,
+              clientName: client.name,
+              event: emailChanged
+                ? "portal_login_email_or_password_updated"
+                : "portal_password_updated",
+              changedEmail: targetEmail,
+              changedPassword: !!providedPortalPassword,
+              previousEmail: emailChanged ? prevEmail : undefined,
+            });
+          }
         }
       }
     }
@@ -329,11 +398,97 @@ router.delete("/clients/:id", auth(["team"]), async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// TEAM (dashboard sidebar)
+// ═══════════════════════════════════════════════════════════════
+function isValidHexColor(value) {
+  if (typeof value !== "string") return false;
+  const s = value.trim();
+  return /^#[0-9A-Fa-f]{3}([0-9A-Fa-f]{3})?$/.test(s);
+}
+
+router.get("/team", auth(["team"]), async (req, res) => {
+  try {
+    const users = await User.find({ role: "team" })
+      .select("name email initials color teamRole")
+      .sort({ name: 1 })
+      .lean();
+    res.json(users);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/team", auth(["team"]), async (req, res) => {
+  try {
+    const email = normalizeEmail(req.body?.email);
+    const password =
+      typeof req.body?.password === "string" ? req.body.password.trim() : "";
+    const name =
+      typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    const teamRole =
+      typeof req.body?.teamRole === "string"
+        ? req.body.teamRole.trim()
+        : "";
+    const initialsRaw =
+      typeof req.body?.initials === "string"
+        ? req.body.initials.trim().slice(0, 4)
+        : "";
+    const colorRaw =
+      typeof req.body?.color === "string" ? req.body.color.trim() : "";
+
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    if (!password || password.length < 8) {
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 8 characters" });
+    }
+    if (!teamRole) {
+      return res.status(400).json({ error: "Team role is required" });
+    }
+
+    const exists = await User.findOne({ email });
+    if (exists) {
+      return res.status(409).json({ error: "That email is already in use" });
+    }
+
+    const initials =
+      initialsRaw ||
+      (name.length ? String(name[0]).toUpperCase() : "");
+    const color =
+      colorRaw && isValidHexColor(colorRaw) ? colorRaw.trim() : "#C8953A";
+
+    const created = await User.create({
+      email,
+      passwordHash: await bcrypt.hash(password, 10),
+      role: "team",
+      name,
+      teamRole,
+      initials: initials || undefined,
+      color,
+    });
+
+    const safe = await User.findById(created._id)
+      .select("name email initials color teamRole")
+      .lean();
+    res.status(201).json(safe);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // EVENTS (Calendar)
 // ═══════════════════════════════════════════════════════════════
 router.get("/events", auth(["team"]), async (req, res) => {
   try {
-    const events = await Event.find().sort({ date: 1 });
+    const events = await Event.find()
+      .populate("assigneeId", "name initials color teamRole")
+      .sort({ date: 1, time: 1, name: 1 });
     res.json(events);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -342,6 +497,12 @@ router.get("/events", auth(["team"]), async (req, res) => {
 
 router.post("/events", auth(["team"]), async (req, res) => {
   try {
+    if (
+      !req.body.assigneeId ||
+      !mongoose.Types.ObjectId.isValid(String(req.body.assigneeId))
+    ) {
+      return res.status(400).json({ error: "assigneeId is required" });
+    }
     const ev = await Event.create(req.body);
     await log(
       `<strong>${req.user.name}</strong> event toegevoegd: <strong>${ev.name}</strong>`,
@@ -357,6 +518,12 @@ router.post("/events", auth(["team"]), async (req, res) => {
 
 router.put("/events/:id", auth(["team"]), async (req, res) => {
   try {
+    if (
+      !req.body.assigneeId ||
+      !mongoose.Types.ObjectId.isValid(String(req.body.assigneeId))
+    ) {
+      return res.status(400).json({ error: "assigneeId is required" });
+    }
     const ev = await Event.findByIdAndUpdate(req.params.id, req.body, {
       new: true,
     });
@@ -1162,6 +1329,158 @@ router.post("/checker/analyze", auth(["team"]), async (req, res) => {
     }));
 
     res.json({ errors });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+function safeCheckerFilename(name) {
+  const raw = typeof name === "string" ? name : "video";
+  const base = raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
+  return base || "video.bin";
+}
+
+function checkerObjectUrl(bucket, region, key) {
+  const path = key
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+  return `https://${bucket}.s3.${region}.amazonaws.com/${path}`;
+}
+
+router.post("/checker/upload/presign", auth(["team"]), async (req, res) => {
+  try {
+    const aws = readAwsCheckerEnv();
+    if (!hasBucketAndRegion(aws)) {
+      return res.status(503).json({
+        error:
+          "S3 is not configured: set AWS_REGION and AWS_S3_BUCKET in foureel-backend/.env",
+      });
+    }
+    if (!hasSigningCredentials(aws)) {
+      return res.status(503).json({
+        error:
+          "Missing signing keys: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in foureel-backend/.env (IAM with s3:PutObject), then restart the API.",
+      });
+    }
+
+    const { bucket, region } = aws;
+    const filename = safeCheckerFilename(req.body?.filename);
+    const contentType =
+      typeof req.body?.contentType === "string" && req.body.contentType.trim()
+        ? req.body.contentType.trim()
+        : "application/octet-stream";
+
+    const userId = String(req.user.id);
+    const key = `video-checker/${userId}/${Date.now()}-${filename}`;
+
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      ContentType: contentType,
+    });
+
+    const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 60 });
+    const videoUrl = checkerObjectUrl(bucket, region, key);
+
+    res.json({ uploadUrl, key, videoUrl, method: "PUT", contentType });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/checker/runs", auth(["team"]), async (req, res) => {
+  try {
+    const aws = readAwsCheckerEnv();
+    if (!hasBucketAndRegion(aws)) {
+      return res.status(503).json({
+        error:
+          "S3 is not configured: set AWS_REGION and AWS_S3_BUCKET in foureel-backend/.env",
+      });
+    }
+    const { bucket, region } = aws;
+
+    const key = typeof req.body?.s3Key === "string" ? req.body.s3Key.trim() : "";
+    const ownerPrefix = `video-checker/${String(req.user.id)}/`;
+    if (!key || !key.startsWith(ownerPrefix)) {
+      return res.status(400).json({ error: "Invalid or missing s3Key" });
+    }
+
+    const expectedUrl = checkerObjectUrl(bucket, region, key);
+    const videoUrl =
+      typeof req.body?.videoUrl === "string" && req.body.videoUrl.trim()
+        ? req.body.videoUrl.trim()
+        : expectedUrl;
+    if (videoUrl !== expectedUrl) {
+      return res.status(400).json({ error: "videoUrl does not match s3Key" });
+    }
+
+    const frames = Array.isArray(req.body?.frames) ? req.body.frames : [];
+    const summary = req.body?.summary || {};
+    const settings = req.body?.settings || {};
+
+    const doc = await VideoCheckerRun.create({
+      uploadedById: req.user.id,
+      uploadedByName:
+        typeof req.user.name === "string" ? req.user.name : undefined,
+      videoOriginalName:
+        typeof req.body?.videoOriginalName === "string"
+          ? req.body.videoOriginalName.slice(0, 500)
+          : undefined,
+      videoContentType:
+        typeof req.body?.videoContentType === "string"
+          ? req.body.videoContentType.slice(0, 200)
+          : undefined,
+      videoSizeBytes:
+        typeof req.body?.videoSizeBytes === "number"
+          ? Math.max(0, Math.floor(req.body.videoSizeBytes))
+          : undefined,
+      durationSec:
+        typeof req.body?.durationSec === "number" &&
+        Number.isFinite(req.body.durationSec)
+          ? req.body.durationSec
+          : undefined,
+      s3Key: key,
+      videoUrl: expectedUrl,
+      settings: {
+        intervalSec:
+          typeof settings.intervalSec === "string"
+            ? settings.intervalSec
+            : undefined,
+        lang: typeof settings.lang === "string" ? settings.lang : undefined,
+        mode: typeof settings.mode === "string" ? settings.mode : undefined,
+      },
+      summary: {
+        frameCount:
+          typeof summary.frameCount === "number"
+            ? summary.frameCount
+            : frames.length,
+        errorCount:
+          typeof summary.errorCount === "number" ? summary.errorCount : 0,
+        cleanCount:
+          typeof summary.cleanCount === "number" ? summary.cleanCount : 0,
+      },
+      frames: frames.map((f) => ({
+        idx: typeof f.idx === "number" ? f.idx : Number(f.idx) || 0,
+        timestamp:
+          typeof f.timestamp === "number"
+            ? f.timestamp
+            : Number(f.timestamp) || 0,
+        text: typeof f.text === "string" ? f.text.slice(0, 20000) : "",
+        issues: Array.isArray(f.errors)
+          ? f.errors.map((err) => ({
+              wrong: err.wrong,
+              suggestion: err.suggestion,
+              message: err.message,
+              offset: err.offset,
+              length: err.length,
+              ruleId: err.ruleId,
+            }))
+          : [],
+      })),
+    });
+
+    res.status(201).json({ id: doc._id });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

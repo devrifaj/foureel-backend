@@ -145,6 +145,8 @@ const EventSchema = new Schema(
       required: true,
     },
     date: { type: String, required: true }, // YYYY-MM-DD
+    time: { type: String, trim: true }, // HH:mm (local studio time)
+    assigneeId: { type: Schema.Types.ObjectId, ref: "User" },
     clientId: { type: Schema.Types.ObjectId, ref: "Client" },
     client: String, // client name string for display
     notes: String,
@@ -320,6 +322,54 @@ const ActivitySchema = new Schema(
   { timestamps: true },
 );
 
+// ── Video checker run (spell-check scan + S3 video) ───────────
+const CheckerErrorSchema = new Schema(
+  {
+    wrong: String,
+    suggestion: String,
+    message: String,
+    offset: Number,
+    length: Number,
+    ruleId: String,
+  },
+  { _id: false },
+);
+
+const CheckerFrameSchema = new Schema(
+  {
+    idx: Number,
+    timestamp: Number,
+    text: String,
+    issues: [CheckerErrorSchema],
+  },
+  { _id: false },
+);
+
+const VideoCheckerRunSchema = new Schema(
+  {
+    uploadedById: { type: Schema.Types.ObjectId, ref: "User" },
+    uploadedByName: String,
+    videoOriginalName: String,
+    videoContentType: String,
+    videoSizeBytes: Number,
+    durationSec: Number,
+    s3Key: { type: String, required: true },
+    videoUrl: { type: String, required: true },
+    settings: {
+      intervalSec: String,
+      lang: String,
+      mode: String,
+    },
+    summary: {
+      frameCount: Number,
+      errorCount: Number,
+      cleanCount: Number,
+    },
+    frames: [CheckerFrameSchema],
+  },
+  { timestamps: true },
+);
+
 module.exports = {
   User: mongoose.model("User", UserSchema),
   Client: mongoose.model("Client", ClientSchema),
@@ -329,4 +379,5 @@ module.exports = {
   Note: mongoose.model("Note", NoteSchema),
   Questionnaire: mongoose.model("Questionnaire", QuestionnaireSchema),
   Activity: mongoose.model("Activity", ActivitySchema),
+  VideoCheckerRun: mongoose.model("VideoCheckerRun", VideoCheckerRunSchema),
 };
