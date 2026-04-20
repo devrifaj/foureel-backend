@@ -8,6 +8,7 @@ const {
   Event,
   Task,
   Batch,
+  Workspace,
   Note,
   Questionnaire,
   Activity,
@@ -429,10 +430,6 @@ router.post("/team", auth(["team"]), async (req, res) => {
       typeof req.body?.teamRole === "string"
         ? req.body.teamRole.trim()
         : "";
-    const initialsRaw =
-      typeof req.body?.initials === "string"
-        ? req.body.initials.trim().slice(0, 4)
-        : "";
     const colorRaw =
       typeof req.body?.color === "string" ? req.body.color.trim() : "";
 
@@ -456,9 +453,7 @@ router.post("/team", auth(["team"]), async (req, res) => {
       return res.status(409).json({ error: "That email is already in use" });
     }
 
-    const initials =
-      initialsRaw ||
-      (name.length ? String(name[0]).toUpperCase() : "");
+    const initials = name.length ? String(name[0]).toUpperCase() : "";
     const color =
       colorRaw && isValidHexColor(colorRaw) ? colorRaw.trim() : "#C8953A";
 
@@ -826,6 +821,229 @@ router.delete(
       batch.videos.pull({ _id: req.params.videoId });
       await batch.save();
       res.json(batch);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ═══════════════════════════════════════════════════════════════
+// WORKSPACES (new hierarchy: Workspace → Batches → Videos)
+// ═══════════════════════════════════════════════════════════════
+router.get("/workspaces", auth(["team"]), async (req, res) => {
+  try {
+    const workspaces = await Workspace.find().sort({ createdAt: -1 });
+    res.json(workspaces);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/workspaces", auth(["team"]), async (req, res) => {
+  try {
+    if (!req.body?.name?.trim()) {
+      return res.status(400).json({ error: "Workspace name is required" });
+    }
+    const clientId = await resolveClientIdFromPayload(req.body);
+    const workspace = await Workspace.create({
+      ...req.body,
+      clientId: clientId || req.body.clientId,
+      batches: Array.isArray(req.body.batches) ? req.body.batches : [],
+    });
+    res.status(201).json(workspace);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put("/workspaces/:id", auth(["team"]), async (req, res) => {
+  try {
+    const clientId = await resolveClientIdFromPayload(req.body);
+    const workspace = await Workspace.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true },
+    );
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    if (clientId && !workspace.clientId) {
+      workspace.clientId = clientId;
+      await workspace.save();
+    }
+    res.json(workspace);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete("/workspaces/:id", auth(["team"]), async (req, res) => {
+  try {
+    await Workspace.findByIdAndDelete(req.params.id);
+    res.json({ message: "Deleted" });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// ── Nested: Batches inside a Workspace ────────────────────────
+router.post("/workspaces/:wsId/batches", auth(["team"]), async (req, res) => {
+  try {
+    const workspace = await Workspace.findById(req.params.wsId);
+    if (!workspace) return res.status(404).json({ error: "Workspace not found" });
+    const name = typeof req.body?.name === "string" ? req.body.name.trim() : "";
+    if (!name) return res.status(400).json({ error: "Batch name is required" });
+
+    workspace.batches.push({
+      name,
+      emoji: req.body?.emoji || "🎬",
+      videos: [],
+    });
+    await workspace.save();
+    res.status(201).json(workspace);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.put(
+  "/workspaces/:wsId/batches/:bId",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const workspace = await Workspace.findById(req.params.wsId);
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      const batch = workspace.batches.id(req.params.bId);
+      if (!batch) return res.status(404).json({ error: "Batch not found" });
+
+      const { name, emoji } = req.body || {};
+      if (typeof name === "string" && name.trim()) batch.name = name.trim();
+      if (typeof emoji === "string") batch.emoji = emoji;
+
+      await workspace.save();
+      res.json(workspace);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+router.delete(
+  "/workspaces/:wsId/batches/:bId",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const workspace = await Workspace.findById(req.params.wsId);
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      workspace.batches.pull({ _id: req.params.bId });
+      await workspace.save();
+      res.json(workspace);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+// ── Nested: Videos inside a Batch inside a Workspace ──────────
+router.post(
+  "/workspaces/:wsId/batches/:bId/videos",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const workspace = await Workspace.findById(req.params.wsId);
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      const batch = workspace.batches.id(req.params.bId);
+      if (!batch) return res.status(404).json({ error: "Batch not found" });
+
+      batch.videos.push(req.body);
+      await workspace.save();
+      res.status(201).json(workspace);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+router.put(
+  "/workspaces/:wsId/batches/:bId/videos/:vId",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const workspace = await Workspace.findById(req.params.wsId);
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      const batch = workspace.batches.id(req.params.bId);
+      if (!batch) return res.status(404).json({ error: "Batch not found" });
+      const video = batch.videos.id(req.params.vId);
+      if (!video) return res.status(404).json({ error: "Video not found" });
+
+      Object.assign(video, req.body);
+      await workspace.save();
+
+      // Auto-push to portal when fase = waitreview (mirrors legacy /batches flow)
+      if (req.body.editFase === "waitreview") {
+        if (!video.portalPushed) {
+          video.portalPushed = true;
+          video.revision = false;
+          video.revisionNote = "";
+          video.approved = false;
+          video.approvedAt = null;
+          await workspace.save();
+        }
+
+        const targetClientId =
+          workspace.clientId || (await resolveClientIdFromPayload(workspace));
+        const client = targetClientId
+          ? await Client.findById(targetClientId)
+          : null;
+        if (client) {
+          const existingPushNote = await Note.findOne({
+            clientId: client._id,
+            from: "studio",
+            text: `Video "${video.name}" staat klaar voor jouw beoordeling.`,
+          }).sort({ createdAt: -1 });
+          const recentDuplicate =
+            existingPushNote &&
+            Date.now() - new Date(existingPushNote.createdAt).getTime() <
+              60 * 1000;
+          if (!recentDuplicate) {
+            await Note.create({
+              clientId: client._id,
+              from: "studio",
+              author: "Team · 4REEL",
+              text: `Video "${video.name}" staat klaar voor jouw beoordeling.`,
+            });
+          }
+          await log(
+            `Video <strong>${video.name}</strong> naar klantportaal gestuurd`,
+            "var(--accent)",
+            "workspace",
+            req.user.name,
+          );
+        }
+      }
+
+      res.json(workspace);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+router.delete(
+  "/workspaces/:wsId/batches/:bId/videos/:vId",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const workspace = await Workspace.findById(req.params.wsId);
+      if (!workspace)
+        return res.status(404).json({ error: "Workspace not found" });
+      const batch = workspace.batches.id(req.params.bId);
+      if (!batch) return res.status(404).json({ error: "Batch not found" });
+      batch.videos.pull({ _id: req.params.vId });
+      await workspace.save();
+      res.json(workspace);
     } catch (e) {
       res.status(500).json({ error: e.message });
     }

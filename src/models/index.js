@@ -281,6 +281,53 @@ const BatchSchema = new Schema(
   { timestamps: true },
 );
 
+// ── Workspace (new: top-level project that owns Batches) ──────
+// A Workspace has the top-level project metadata (client, editor,
+// deadline, stage, shoot info, links, resources, notes) and contains
+// one or more Batches. Each Batch owns its own array of Videos.
+const WorkspaceBatchSchema = new Schema(
+  {
+    name: { type: String, required: true },
+    emoji: { type: String, default: "🎬" },
+    videos: [VideoSchema],
+  },
+  { timestamps: true, _id: true },
+);
+
+const WorkspaceSchema = new Schema(
+  {
+    name: { type: String, required: true },
+    emoji: { type: String, default: "📁" },
+    clientId: { type: Schema.Types.ObjectId, ref: "Client" },
+    client: String,
+    editor: String,
+    shootDate: String,
+    shootStatus: {
+      type: String,
+      enum: ["wrapped", "tentative", "waiting", "planned"],
+      default: "planned",
+    },
+    deadline: String,
+    projectStage: {
+      type: String,
+      enum: [
+        "development",
+        "preproduction",
+        "shooting",
+        "post-production",
+        "completed",
+      ],
+      default: "preproduction",
+    },
+    notes: String,
+    lastReview: String,
+    links: [{ label: String, url: String }],
+    resources: { type: BatchResourcesSchema, default: () => ({}) },
+    batches: [WorkspaceBatchSchema],
+  },
+  { timestamps: true },
+);
+
 // ── Portal Note (chat message) ────────────────────────────────
 const NoteSchema = new Schema(
   {
@@ -376,6 +423,7 @@ module.exports = {
   Event: mongoose.model("Event", EventSchema),
   Task: mongoose.model("Task", TaskSchema),
   Batch: mongoose.model("Batch", BatchSchema),
+  Workspace: mongoose.model("Workspace", WorkspaceSchema),
   Note: mongoose.model("Note", NoteSchema),
   Questionnaire: mongoose.model("Questionnaire", QuestionnaireSchema),
   Activity: mongoose.model("Activity", ActivitySchema),
