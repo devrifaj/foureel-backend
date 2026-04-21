@@ -164,6 +164,11 @@ const TaskSchema = new Schema(
   {
     title: { type: String, required: true },
     assignee: String,
+    status: {
+      type: String,
+      enum: ["active", "delete"],
+      default: "active",
+    },
     clientId: { type: Schema.Types.ObjectId, ref: "Client" },
     client: String,
     column: {

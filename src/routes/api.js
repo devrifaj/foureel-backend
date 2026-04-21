@@ -476,6 +476,93 @@ router.post("/team", auth(["team"]), async (req, res) => {
   }
 });
 
+router.put("/team/:id", auth(["team"]), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid team member id" });
+    }
+    const existing = await User.findOne({ _id: req.params.id, role: "team" });
+    if (!existing) {
+      return res.status(404).json({ error: "Team member not found" });
+    }
+
+    const name =
+      typeof req.body?.name === "string" ? req.body.name.trim() : existing.name;
+    const emailRaw =
+      typeof req.body?.email === "string" ? req.body.email : existing.email;
+    const email = normalizeEmail(emailRaw);
+    const teamRole =
+      typeof req.body?.teamRole === "string"
+        ? req.body.teamRole.trim()
+        : existing.teamRole || "";
+    const colorRaw =
+      typeof req.body?.color === "string" ? req.body.color.trim() : existing.color;
+    const password =
+      typeof req.body?.password === "string" ? req.body.password.trim() : "";
+
+    if (!name) {
+      return res.status(400).json({ error: "Name is required" });
+    }
+    if (!email || !EMAIL_REGEX.test(email)) {
+      return res.status(400).json({ error: "A valid email is required" });
+    }
+    if (!teamRole) {
+      return res.status(400).json({ error: "Team role is required" });
+    }
+    if (password && password.length < 8) {
+      return res
+        .status(400)
+        .json({ error: "Password must be at least 8 characters" });
+    }
+
+    const emailConflict = await User.findOne({
+      email,
+      _id: { $ne: existing._id },
+    });
+    if (emailConflict) {
+      return res.status(409).json({ error: "That email is already in use" });
+    }
+
+    const initials = name.length ? String(name[0]).toUpperCase() : "";
+    existing.name = name;
+    existing.email = email;
+    existing.teamRole = teamRole;
+    existing.initials = initials || undefined;
+    existing.color =
+      colorRaw && isValidHexColor(colorRaw) ? colorRaw.trim() : "#C8953A";
+    if (password) {
+      existing.passwordHash = await bcrypt.hash(password, 10);
+    }
+    await existing.save();
+
+    const safe = await User.findById(existing._id)
+      .select("name email initials color teamRole")
+      .lean();
+    res.json(safe);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.delete("/team/:id", auth(["team"]), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid team member id" });
+    }
+    const deleted = await User.findOneAndDelete({
+      _id: req.params.id,
+      role: "team",
+    });
+    if (!deleted) {
+      return res.status(404).json({ error: "Team member not found" });
+    }
+    const deletedOwnAccount = String(req.user.id) === String(req.params.id);
+    res.json({ message: "Deleted", deletedOwnAccount });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // EVENTS (Calendar)
 // ═══════════════════════════════════════════════════════════════
@@ -542,7 +629,9 @@ router.delete("/events/:id", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 router.get("/tasks", auth(["team"]), async (req, res) => {
   try {
-    const tasks = await Task.find({ archived: false }).sort({ createdAt: -1 });
+    const tasks = await Task.find({ archived: false, status: { $ne: "delete" } }).sort({
+      createdAt: -1,
+    });
     res.json(tasks);
   } catch (e) {
     res.status(500).json({ error: e.message });
