@@ -34,6 +34,30 @@ UserSchema.pre("validate", function (next) {
 });
 
 // ── Client ────────────────────────────────────────────────────
+const ClientContactSchema = new Schema(
+  {
+    name: { type: String, trim: true },
+    email: { type: String, trim: true, lowercase: true },
+    phone: { type: String, trim: true },
+    role: { type: String, trim: true },
+    primary: { type: Boolean, default: false },
+  },
+  { _id: true },
+);
+
+const ClientDocumentSchema = new Schema(
+  {
+    name: { type: String, required: true, trim: true },
+    key: { type: String, required: true, trim: true },
+    url: { type: String, required: true, trim: true },
+    contentType: { type: String, trim: true },
+    sizeBytes: { type: Number, min: 0 },
+    uploadedById: { type: Schema.Types.ObjectId, ref: "User" },
+    uploadedByName: { type: String, trim: true },
+  },
+  { timestamps: true, _id: true },
+);
+
 const ClientSchema = new Schema(
   {
     name: { type: String, required: true },
@@ -42,6 +66,8 @@ const ClientSchema = new Schema(
     contact: String,
     email: String,
     phone: String,
+    contacts: { type: [ClientContactSchema], default: [] },
+    documents: { type: [ClientDocumentSchema], default: [] },
     since: String,
     urgent: { type: Boolean, default: false },
     urgentReason: String,

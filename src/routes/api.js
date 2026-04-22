@@ -73,6 +73,65 @@ function hasOwn(obj, key) {
   return Object.prototype.hasOwnProperty.call(obj, key);
 }
 
+function safeClientDocumentFilename(name) {
+  const raw = typeof name === "string" ? name : "document";
+  const base = raw.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 180);
+  return base || "document.bin";
+}
+
+function clientDocumentObjectUrl(bucket, region, key) {
+  const path = key
+    .split("/")
+    .map((seg) => encodeURIComponent(seg))
+    .join("/");
+  return `https://${bucket}.s3.${region}.amazonaws.com/${path}`;
+}
+
+function normalizeClientContacts(rawContacts = [], fallback = {}) {
+  const normalized = (Array.isArray(rawContacts) ? rawContacts : [])
+    .map((contact) => ({
+      name: typeof contact?.name === "string" ? contact.name.trim() : "",
+      email: normalizeEmail(contact?.email),
+      phone: typeof contact?.phone === "string" ? contact.phone.trim() : "",
+      role: typeof contact?.role === "string" ? contact.role.trim() : "",
+      primary: Boolean(contact?.primary),
+    }))
+    .filter((contact) => contact.name || contact.email || contact.phone || contact.role);
+
+  const fallbackContact = {
+    name: typeof fallback.contact === "string" ? fallback.contact.trim() : "",
+    email: normalizeEmail(fallback.email),
+    phone: typeof fallback.phone === "string" ? fallback.phone.trim() : "",
+    role: "",
+    primary: true,
+  };
+  const hasFallbackValues = Boolean(
+    fallbackContact.name || fallbackContact.email || fallbackContact.phone,
+  );
+
+  if (normalized.length === 0 && hasFallbackValues) {
+    normalized.push(fallbackContact);
+  }
+
+  if (normalized.length > 0 && !normalized.some((contact) => contact.primary)) {
+    normalized[0].primary = true;
+  }
+
+  return normalized;
+}
+
+function withLegacyClientContactFields(payload = {}) {
+  const contacts = normalizeClientContacts(payload.contacts, payload);
+  const primary = contacts.find((contact) => contact.primary) || contacts[0];
+  return {
+    ...payload,
+    contacts,
+    contact: primary?.name || undefined,
+    email: primary?.email || undefined,
+    phone: primary?.phone || undefined,
+  };
+}
+
 async function resolveClientIdFromPayload(payload = {}) {
   if (payload.clientId) return payload.clientId;
   const name = typeof payload.client === "string" ? payload.client.trim() : "";
@@ -123,7 +182,16 @@ function sanitizeClient(clientDoc) {
   if (!clientDoc) return clientDoc;
   const obj =
     typeof clientDoc.toObject === "function" ? clientDoc.toObject() : clientDoc;
-  return { ...obj, portalPassword: undefined };
+  const contacts = normalizeClientContacts(obj.contacts, obj);
+  const primary = contacts.find((contact) => contact.primary) || contacts[0];
+  return {
+    ...obj,
+    contacts,
+    contact: primary?.name || obj.contact || undefined,
+    email: primary?.email || obj.email || undefined,
+    phone: primary?.phone || obj.phone || undefined,
+    portalPassword: undefined,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -188,10 +256,10 @@ router.post("/clients", auth(["team"]), async (req, res) => {
       }
     }
 
-    const payload = {
+    const payload = withLegacyClientContactFields({
       ...req.body,
       portalEmail: hasPortalEmail ? normalizedPortalEmail : undefined,
-    };
+    });
     delete payload.portalPassword;
 
     const client = await Client.create({
@@ -296,9 +364,17 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
       }
     }
 
-    const updatePayload = {
+    const updatePayload = withLegacyClientContactFields({
       ...req.body,
-    };
+      contacts: hasOwn(req.body, "contacts")
+        ? req.body.contacts
+        : existingClient.contacts,
+      contact: hasOwn(req.body, "contact")
+        ? req.body.contact
+        : existingClient.contact,
+      email: hasOwn(req.body, "email") ? req.body.email : existingClient.email,
+      phone: hasOwn(req.body, "phone") ? req.body.phone : existingClient.phone,
+    });
     if (hasPortalPasswordInPayload) {
       updatePayload.portalPassword = hashedPortalPassword;
     } else {
@@ -384,6 +460,123 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
     }
 
     res.json(sanitizeClient(client));
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.get("/clients/:id/documents", auth(["team"]), async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id).select("documents");
+    if (!client) return res.status(404).json({ error: "Client not found" });
+    const docs = Array.isArray(client.documents) ? client.documents : [];
+    const sorted = [...docs].sort((a, b) => {
+      const left = new Date(a.createdAt || 0).getTime();
+      const right = new Date(b.createdAt || 0).getTime();
+      return right - left;
+    });
+    res.json(sorted);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post(
+  "/clients/:id/documents/presign",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const client = await Client.findById(req.params.id).select("_id");
+      if (!client) return res.status(404).json({ error: "Client not found" });
+
+      const aws = readAwsCheckerEnv();
+      if (!hasBucketAndRegion(aws)) {
+        return res.status(503).json({
+          error:
+            "S3 is not configured: set AWS_REGION and AWS_S3_BUCKET in foureel-backend/.env",
+        });
+      }
+      if (!hasSigningCredentials(aws)) {
+        return res.status(503).json({
+          error:
+            "Missing signing keys: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in foureel-backend/.env (IAM with s3:PutObject), then restart the API.",
+        });
+      }
+
+      const { bucket, region } = aws;
+      const filename = safeClientDocumentFilename(req.body?.filename);
+      const contentType =
+        typeof req.body?.contentType === "string" && req.body.contentType.trim()
+          ? req.body.contentType.trim()
+          : "application/octet-stream";
+      const key = `client-documents/${String(client._id)}/${Date.now()}-${filename}`;
+
+      const command = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        ContentType: contentType,
+      });
+
+      const uploadUrl = await getSignedUrl(s3, command, { expiresIn: 60 * 60 });
+      const fileUrl = clientDocumentObjectUrl(bucket, region, key);
+      res.json({ uploadUrl, key, fileUrl, method: "PUT", contentType });
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
+
+router.post("/clients/:id/documents", auth(["team"]), async (req, res) => {
+  try {
+    const client = await Client.findById(req.params.id);
+    if (!client) return res.status(404).json({ error: "Client not found" });
+
+    const aws = readAwsCheckerEnv();
+    if (!hasBucketAndRegion(aws)) {
+      return res.status(503).json({
+        error:
+          "S3 is not configured: set AWS_REGION and AWS_S3_BUCKET in foureel-backend/.env",
+      });
+    }
+
+    const key = typeof req.body?.key === "string" ? req.body.key.trim() : "";
+    const expectedPrefix = `client-documents/${String(client._id)}/`;
+    if (!key || !key.startsWith(expectedPrefix)) {
+      return res.status(400).json({ error: "Invalid or missing document key" });
+    }
+
+    const expectedUrl = clientDocumentObjectUrl(aws.bucket, aws.region, key);
+    const fileUrl =
+      typeof req.body?.fileUrl === "string" && req.body.fileUrl.trim()
+        ? req.body.fileUrl.trim()
+        : expectedUrl;
+    if (fileUrl !== expectedUrl) {
+      return res.status(400).json({ error: "fileUrl does not match key" });
+    }
+
+    const name =
+      typeof req.body?.name === "string" && req.body.name.trim()
+        ? req.body.name.trim()
+        : key.split("/").pop() || "document";
+    const contentType =
+      typeof req.body?.contentType === "string" ? req.body.contentType.trim() : "";
+    const sizeBytes = Number.isFinite(Number(req.body?.sizeBytes))
+      ? Math.max(0, Math.floor(Number(req.body.sizeBytes)))
+      : undefined;
+
+    client.documents.push({
+      name,
+      key,
+      url: expectedUrl,
+      contentType: contentType || undefined,
+      sizeBytes,
+      uploadedById: req.user.id,
+      uploadedByName: req.user.name,
+    });
+    await client.save();
+
+    const createdDoc = client.documents[client.documents.length - 1];
+    res.status(201).json(createdDoc);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
