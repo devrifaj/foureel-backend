@@ -6,11 +6,31 @@ function hasPayloadShape(decoded) {
     typeof decoded === "object" &&
     Boolean(decoded.id) &&
     typeof decoded.role === "string" &&
-    Object.prototype.hasOwnProperty.call(decoded, "clientId")
+    Object.prototype.hasOwnProperty.call(decoded, "clientId") &&
+    Object.prototype.hasOwnProperty.call(decoded, "teamAccessLevel")
   );
 }
 
-const auth = (roles = []) => (req, res, next) => {
+function normalizeAuthOptions(input) {
+  if (Array.isArray(input)) {
+    const teamAccessLevels = input.includes("team") ? ["admin"] : [];
+    return { roles: input, teamAccessLevels };
+  }
+  if (!input || typeof input !== "object") return { roles: [], teamAccessLevels: [] };
+  const normalized = {
+    roles: Array.isArray(input.roles) ? input.roles : [],
+    teamAccessLevels: Array.isArray(input.teamAccessLevels)
+      ? input.teamAccessLevels
+      : [],
+  };
+  if (normalized.roles.includes("team") && normalized.teamAccessLevels.length === 0) {
+    normalized.teamAccessLevels = ["admin"];
+  }
+  return normalized;
+}
+
+const auth = (options = []) => (req, res, next) => {
+  const { roles, teamAccessLevels } = normalizeAuthOptions(options);
   const token = req.cookies?.token || req.headers.authorization?.split(' ')[1];
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
 
@@ -22,6 +42,13 @@ const auth = (roles = []) => (req, res, next) => {
     req.user = decoded;
     if (roles.length && !roles.includes(decoded.role)) {
       return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    if (
+      decoded.role === "team" &&
+      teamAccessLevels.length &&
+      !teamAccessLevels.includes(decoded.teamAccessLevel)
+    ) {
+      return res.status(403).json({ error: "Insufficient permissions" });
     }
     next();
   } catch (e) {

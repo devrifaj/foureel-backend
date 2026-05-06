@@ -32,6 +32,7 @@ const sign = (user) =>
       role: user.role,
       name: user.name,
       clientId: user.clientId || null,
+      teamAccessLevel: user.teamAccessLevel || null,
     },
     process.env.JWT_SECRET,
     { expiresIn: "7d" },
@@ -288,6 +289,8 @@ router.post("/login", async (req, res) => {
         role: user.role,
         email: user.email,
         clientId: user.clientId,
+        teamRole: user.teamRole || "",
+        teamAccessLevel: user.teamAccessLevel || null,
       },
       clientData,
     });
@@ -321,6 +324,7 @@ router.post("/seed", async (req, res) => {
     res.json({
       message: "Team users seeded",
       created: result.createdCount,
+      updated: result.updatedCount,
       total: result.total,
     });
   } catch (e) {

@@ -17,7 +17,12 @@ const UserSchema = new Schema(
     name: { type: String, required: true },
     initials: String,
     color: String,
-    teamRole: String, // 'Creative Director', 'Editor', etc.
+    teamRole: String, // display label, e.g. 'Creative Director'
+    teamAccessLevel: {
+      type: String,
+      enum: ["admin", "editor"],
+      default: "editor",
+    },
     clientId: { type: Schema.Types.ObjectId, ref: "Client" }, // for portal users
   },
   { timestamps: true },
@@ -29,6 +34,9 @@ UserSchema.pre("validate", function (next) {
   }
   if (this.role === "team") {
     this.clientId = undefined;
+    if (!this.teamAccessLevel) this.teamAccessLevel = "editor";
+  } else {
+    this.teamAccessLevel = undefined;
   }
   next();
 });
@@ -186,6 +194,23 @@ const ChecklistItemSchema = new Schema({
   done: { type: Boolean, default: false },
 });
 
+const TaskLinkSchema = new Schema(
+  {
+    label: String,
+    url: String,
+  },
+  { _id: false },
+);
+
+const TaskCommentSchema = new Schema(
+  {
+    author: String,
+    text: String,
+    createdAt: Date,
+  },
+  { _id: false },
+);
+
 const TaskSchema = new Schema(
   {
     title: { type: String, required: true },
@@ -202,6 +227,7 @@ const TaskSchema = new Schema(
       enum: ["todo", "bezig", "review", "klaar"],
       default: "todo",
     },
+    sortOrder: { type: Number, index: true, default: null },
     priority: {
       type: String,
       enum: ["High", "Normal", "Low"],
@@ -210,6 +236,8 @@ const TaskSchema = new Schema(
     dueDate: String,
     description: String,
     checklist: [ChecklistItemSchema],
+    links: [TaskLinkSchema],
+    comments: [TaskCommentSchema],
     archived: { type: Boolean, default: false },
     archivedAt: Date,
     archivedReason: {
@@ -246,12 +274,28 @@ const VideoSchema = new Schema(
     driveLink: String, // brand assets
     shotlist: [ShotSchema],
     sop: SopSchema,
+    // Frame.io mapping (used by webhook feedback sync)
+    frameAssetId: { type: String, trim: true },
+    frameReviewUrl: { type: String, trim: true },
+    frameLastEventId: { type: String, trim: true },
+    frameLastEventAt: Date,
     // Portal review state
     portalPushed: { type: Boolean, default: false },
     revision: { type: Boolean, default: false },
     revisionNote: String,
     approved: { type: Boolean, default: false },
     approvedAt: Date,
+  },
+  { timestamps: true },
+);
+
+const FrameWebhookEventSchema = new Schema(
+  {
+    eventId: { type: String, required: true, unique: true, index: true },
+    eventType: { type: String, trim: true },
+    frameAssetId: { type: String, trim: true },
+    outcome: { type: String, enum: ["approved", "revision"] },
+    processedAt: { type: Date, default: Date.now },
   },
   { timestamps: true },
 );
@@ -286,6 +330,7 @@ const BatchSchema = new Schema(
     client: String,
     editor: String,
     shootDate: String,
+    shootTime: String,
     shootStatus: {
       type: String,
       enum: ["wrapped", "tentative", "waiting", "planned"],
@@ -333,6 +378,7 @@ const WorkspaceSchema = new Schema(
     client: String,
     editor: String,
     shootDate: String,
+    shootTime: String,
     shootStatus: {
       type: String,
       enum: ["wrapped", "tentative", "waiting", "planned"],
@@ -365,7 +411,26 @@ const NoteSchema = new Schema(
     clientId: { type: Schema.Types.ObjectId, ref: "Client", required: true },
     from: { type: String, enum: ["studio", "client"], required: true },
     author: String,
-    text: { type: String, required: true },
+    text: { type: String, default: "" },
+    channel: { type: String, enum: ["portal", "whatsapp"], default: "portal" },
+    attachments: {
+      type: [
+        new Schema(
+          {
+            name: { type: String, trim: true },
+            key: { type: String, required: true, trim: true },
+            url: { type: String, required: true, trim: true },
+            contentType: { type: String, trim: true },
+            sizeBytes: { type: Number, min: 0 },
+            uploadedById: { type: Schema.Types.ObjectId, ref: "User" },
+            uploadedByName: { type: String, trim: true },
+            uploadedAt: { type: Date, default: Date.now },
+          },
+          { _id: true },
+        ),
+      ],
+      default: [],
+    },
     read: { type: Boolean, default: false },
   },
   { timestamps: true },
@@ -458,5 +523,6 @@ module.exports = {
   Note: mongoose.model("Note", NoteSchema),
   Questionnaire: mongoose.model("Questionnaire", QuestionnaireSchema),
   Activity: mongoose.model("Activity", ActivitySchema),
+  FrameWebhookEvent: mongoose.model("FrameWebhookEvent", FrameWebhookEventSchema),
   VideoCheckerRun: mongoose.model("VideoCheckerRun", VideoCheckerRunSchema),
 };
