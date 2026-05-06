@@ -1996,7 +1996,10 @@ router.delete(
 // ═══════════════════════════════════════════════════════════════
 // PORTAL (team-side read/write for portal tab in klanten)
 // ═══════════════════════════════════════════════════════════════
-router.get("/portal/:clientId/notes", auth(["team"]), async (req, res) => {
+router.get(
+  "/portal/:clientId([0-9a-fA-F]{24})/notes",
+  auth(["team"]),
+  async (req, res) => {
   try {
     const notes = await Note.find({ clientId: req.params.clientId }).sort({
       createdAt: 1,
@@ -2005,21 +2008,26 @@ router.get("/portal/:clientId/notes", auth(["team"]), async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
-});
+  },
+);
 
-router.post("/portal/:clientId/notes", auth(["team"]), async (req, res) => {
-  try {
-    const note = await Note.create({
-      clientId: req.params.clientId,
-      from: "studio",
-      author: req.body.author || `${req.user.name} · 4REEL`,
-      text: req.body.text,
-    });
-    res.status(201).json(note);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
+router.post(
+  "/portal/:clientId([0-9a-fA-F]{24})/notes",
+  auth(["team"]),
+  async (req, res) => {
+    try {
+      const note = await Note.create({
+        clientId: req.params.clientId,
+        from: "studio",
+        author: req.body.author || `${req.user.name} · 4REEL`,
+        text: req.body.text,
+      });
+      res.status(201).json(note);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
+  },
+);
 
 router.post(
   "/portal/:clientId/whatsapp/presign",
