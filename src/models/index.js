@@ -274,7 +274,7 @@ const VideoSchema = new Schema(
     driveLink: String, // brand assets
     shotlist: [ShotSchema],
     sop: SopSchema,
-    // Frame.io mapping (used by webhook feedback sync)
+    // Frame.io mapping
     frameAssetId: { type: String, trim: true },
     frameReviewUrl: { type: String, trim: true },
     frameLastEventId: { type: String, trim: true },
@@ -285,17 +285,6 @@ const VideoSchema = new Schema(
     revisionNote: String,
     approved: { type: Boolean, default: false },
     approvedAt: Date,
-  },
-  { timestamps: true },
-);
-
-const FrameWebhookEventSchema = new Schema(
-  {
-    eventId: { type: String, required: true, unique: true, index: true },
-    eventType: { type: String, trim: true },
-    frameAssetId: { type: String, trim: true },
-    outcome: { type: String, enum: ["approved", "revision"] },
-    processedAt: { type: Date, default: Date.now },
   },
   { timestamps: true },
 );
@@ -523,6 +512,5 @@ module.exports = {
   Note: mongoose.model("Note", NoteSchema),
   Questionnaire: mongoose.model("Questionnaire", QuestionnaireSchema),
   Activity: mongoose.model("Activity", ActivitySchema),
-  FrameWebhookEvent: mongoose.model("FrameWebhookEvent", FrameWebhookEventSchema),
   VideoCheckerRun: mongoose.model("VideoCheckerRun", VideoCheckerRunSchema),
 };

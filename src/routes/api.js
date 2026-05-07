@@ -1,7 +1,6 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const bcrypt = require("bcryptjs");
-const crypto = require("crypto");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { getSignedUrl } = require("@aws-sdk/s3-request-presigner");
 const {
@@ -14,7 +13,6 @@ const {
   Questionnaire,
   Activity,
   User,
-  FrameWebhookEvent,
   VideoCheckerRun,
 } = require("../models");
 const s3 = require("../lib/s3");
@@ -76,9 +74,6 @@ const REQUIRED_QUESTIONNAIRE_FIELDS = [
   { key: "af_email", type: "email" },
   { key: "af_extra", type: "textarea" },
 ];
-const FRAMEIO_SIGNATURE_HEADER = "x-frameio-signature";
-const FRAMEIO_TIMESTAMP_HEADER = "x-frameio-request-timestamp";
-
 function getFrameReviewUrl(video) {
   if (!video) return "";
   return (
@@ -103,78 +98,6 @@ function buildFrameReviewPushText(videoName, frameUrl) {
     return `Video "${safeName}" staat klaar voor jouw beoordeling.\nFrame.io: ${frameUrl}`;
   }
   return `Video "${safeName}" staat klaar voor jouw beoordeling.`;
-}
-
-function parseFrameOutcome(payload = {}) {
-  const eventType = String(
-    payload.event || payload.type || payload.action || "",
-  ).toLowerCase();
-  const status = String(
-    payload.status || payload.reviewStatus || payload.approval || "",
-  ).toLowerCase();
-  const decision = String(
-    payload.decision || payload.result || payload.outcome || "",
-  ).toLowerCase();
-  const merged = `${eventType} ${status} ${decision}`;
-  if (/(approve|approved|accept)/.test(merged)) return "approved";
-  if (
-    /(revision|revise|changes_requested|changes-requested|request_changes|requested_changes|reject|rejected)/.test(
-      merged,
-    )
-  ) {
-    return "revision";
-  }
-  return "";
-}
-
-function getFrameAssetIdFromPayload(payload = {}) {
-  const candidates = [
-    payload?.resource?.id,
-    payload?.resource?.asset_id,
-    payload?.resource?.assetId,
-    payload?.asset?.id,
-    payload?.asset?.asset_id,
-    payload?.assetId,
-    payload?.asset_id,
-    payload?.data?.asset?.id,
-    payload?.data?.asset_id,
-    payload?.data?.assetId,
-  ];
-  for (const item of candidates) {
-    if (typeof item === "string" && item.trim()) return item.trim();
-  }
-  return "";
-}
-
-function getFrameEventIdFromPayload(payload = {}) {
-  const candidates = [
-    payload.id,
-    payload.event_id,
-    payload.eventId,
-    payload.delivery_id,
-    payload.deliveryId,
-  ];
-  for (const item of candidates) {
-    if (typeof item === "string" && item.trim()) return item.trim();
-  }
-  return "";
-}
-
-function getFrameRevisionNote(payload = {}) {
-  const candidates = [
-    payload?.comment?.text,
-    payload?.comment,
-    payload?.message,
-    payload?.note,
-    payload?.reason,
-    payload?.data?.comment?.text,
-    payload?.data?.comment,
-  ];
-  for (const item of candidates) {
-    if (typeof item === "string" && item.trim())
-      return item.trim().slice(0, 1000);
-  }
-  return "Revision requested via Frame.io";
 }
 
 function normalizeVideoFrameFields(input = {}) {
@@ -504,197 +427,27 @@ function sanitizeClient(clientDoc) {
   };
 }
 
-function verifyFrameWebhookSignature(req) {
-  const secret =
-    typeof process.env.FRAMEIO_WEBHOOK_SECRET === "string"
-      ? process.env.FRAMEIO_WEBHOOK_SECRET.trim()
-      : "";
-  if (!secret) return false;
-  const signature = req.get(FRAMEIO_SIGNATURE_HEADER);
-  if (!signature) return false;
-  const rawBody =
-    typeof req.rawBody === "string" && req.rawBody.length
-      ? req.rawBody
-      : JSON.stringify(req.body || {});
-  const digest = crypto
-    .createHmac("sha256", secret)
-    .update(rawBody)
-    .digest("hex");
-  const computed = `sha256=${digest}`;
-  try {
-    return crypto.timingSafeEqual(
-      Buffer.from(signature),
-      Buffer.from(computed),
-    );
-  } catch {
-    return false;
+async function findClientVideoForPortalAction(clientId, videoId) {
+  const batches = await Batch.find({ clientId });
+  for (const batch of batches) {
+    const video = batch.videos.id(videoId);
+    if (video) {
+      return { container: batch, video };
+    }
   }
-}
 
-async function applyFrameFeedbackToBatchVideo({
-  batch,
-  video,
-  clientId,
-  outcome,
-  revisionNote,
-  eventId,
-  eventAt,
-}) {
-  if (outcome === "approved") {
-    video.approved = true;
-    video.approvedAt = eventAt;
-    video.revision = false;
-    video.revisionNote = "";
-    video.editFase = "client_approved";
-  } else {
-    video.revision = true;
-    video.revisionNote = revisionNote;
-    video.approved = false;
-    video.approvedAt = null;
-    video.editFase = "client_revision";
-  }
-  video.frameLastEventId = eventId || undefined;
-  video.frameLastEventAt = eventAt;
-  await batch.save();
-
-  const client = await Client.findById(clientId).select("name");
-  await Note.create({
-    clientId,
-    from: "client",
-    author: client?.name || "Client",
-    text:
-      outcome === "approved"
-        ? `Goedgekeurd via Frame.io: "${video.name}"`
-        : `Revisie via Frame.io voor "${video.name}": ${revisionNote}`,
-  });
-}
-
-// Frame.io webhook (server-to-server)
-router.post("/webhooks/frameio", async (req, res) => {
-  try {
-    if (!verifyFrameWebhookSignature(req)) {
-      return res.status(401).json({ error: "Invalid Frame.io signature" });
-    }
-
-    const payload = req.body || {};
-    const eventId = getFrameEventIdFromPayload(payload);
-    const frameAssetId = getFrameAssetIdFromPayload(payload);
-    const outcome = parseFrameOutcome(payload);
-    const requestTs = req.get(FRAMEIO_TIMESTAMP_HEADER);
-    const eventAt =
-      requestTs && Number.isFinite(Number(requestTs))
-        ? new Date(Number(requestTs) * 1000)
-        : new Date();
-
-    if (!eventId || !frameAssetId || !outcome) {
-      return res.status(202).json({
-        message: "Ignored webhook event",
-        reason: "missing_event_id_or_asset_or_outcome",
-      });
-    }
-
-    const existingEvent = await FrameWebhookEvent.findOne({ eventId }).select(
-      "_id",
-    );
-    if (existingEvent) {
-      return res.json({ message: "Already processed" });
-    }
-
-    const revisionNote = getFrameRevisionNote(payload);
-    let handled = false;
-
-    const batches = await Batch.find({ "videos.frameAssetId": frameAssetId });
-    for (const batch of batches) {
-      const video = batch.videos.find(
-        (item) => String(item.frameAssetId || "") === frameAssetId,
-      );
-      if (!video) continue;
-      const clientId =
-        batch.clientId || (await resolveClientIdFromPayload(batch));
-      if (!clientId) continue;
-      await applyFrameFeedbackToBatchVideo({
-        batch,
-        video,
-        clientId,
-        outcome,
-        revisionNote,
-        eventId,
-        eventAt,
-      });
-      handled = true;
-      break;
-    }
-
-    if (!handled) {
-      const workspaces = await Workspace.find({
-        "batches.videos.frameAssetId": frameAssetId,
-      });
-      for (const workspace of workspaces) {
-        let targetVideo = null;
-        for (const batch of workspace.batches || []) {
-          const candidate = (batch.videos || []).find(
-            (item) => String(item.frameAssetId || "") === frameAssetId,
-          );
-          if (candidate) {
-            targetVideo = candidate;
-            break;
-          }
-        }
-        if (!targetVideo) continue;
-        const clientId =
-          workspace.clientId || (await resolveClientIdFromPayload(workspace));
-        if (!clientId) continue;
-        if (outcome === "approved") {
-          targetVideo.approved = true;
-          targetVideo.approvedAt = eventAt;
-          targetVideo.revision = false;
-          targetVideo.revisionNote = "";
-          targetVideo.editFase = "client_approved";
-        } else {
-          targetVideo.revision = true;
-          targetVideo.revisionNote = revisionNote;
-          targetVideo.approved = false;
-          targetVideo.approvedAt = null;
-          targetVideo.editFase = "client_revision";
-        }
-        targetVideo.frameLastEventId = eventId || undefined;
-        targetVideo.frameLastEventAt = eventAt;
-        await workspace.save();
-        const client = await Client.findById(clientId).select("name");
-        await Note.create({
-          clientId,
-          from: "client",
-          author: client?.name || "Client",
-          text:
-            outcome === "approved"
-              ? `Goedgekeurd via Frame.io: "${targetVideo.name}"`
-              : `Revisie via Frame.io voor "${targetVideo.name}": ${revisionNote}`,
-        });
-        handled = true;
-        break;
+  const workspaces = await Workspace.find({ clientId });
+  for (const workspace of workspaces) {
+    for (const wsBatch of workspace.batches || []) {
+      const video = wsBatch.videos.id(videoId);
+      if (video) {
+        return { container: workspace, video };
       }
     }
-
-    if (!handled) {
-      console.warn("[FRAMEIO_WEBHOOK] Unmapped frameAssetId:", frameAssetId);
-      return res.status(202).json({
-        message: "No mapped video found for Frame asset",
-        frameAssetId,
-      });
-    }
-
-    await FrameWebhookEvent.create({
-      eventId,
-      eventType: String(payload.event || payload.type || ""),
-      frameAssetId,
-      outcome,
-      processedAt: new Date(),
-    });
-    return res.json({ message: "Processed", outcome });
-  } catch (e) {
-    return res.status(500).json({ error: e.message });
   }
-});
+
+  return null;
+}
 
 // ═══════════════════════════════════════════════════════════════
 // CLIENTS
@@ -2000,14 +1753,14 @@ router.get(
   "/portal/:clientId([0-9a-fA-F]{24})/notes",
   auth(["team"]),
   async (req, res) => {
-  try {
-    const notes = await Note.find({ clientId: req.params.clientId }).sort({
-      createdAt: 1,
-    });
-    res.json(notes);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
+    try {
+      const notes = await Note.find({ clientId: req.params.clientId }).sort({
+        createdAt: 1,
+      });
+      res.json(notes);
+    } catch (e) {
+      res.status(500).json({ error: e.message });
+    }
   },
 );
 
@@ -2658,26 +2411,28 @@ router.post(
   auth(["client"]),
   async (req, res) => {
     try {
-      const batches = await Batch.find({ clientId: req.user.clientId });
-      for (const batch of batches) {
-        const video = batch.videos.id(req.params.videoId);
-        if (video) {
-          video.approved = true;
-          video.approvedAt = new Date();
-          video.editFase = "client_approved";
-          await batch.save();
-          // Notify studio
-          const client = await Client.findById(req.user.clientId);
-          await Note.create({
-            clientId: req.user.clientId,
-            from: "client",
-            author: client.name,
-            text: `Goedgekeurd: "${video.name}"`,
-          });
-          return res.json({ message: "Approved", video });
-        }
-      }
-      res.status(404).json({ error: "Video not found" });
+      const found = await findClientVideoForPortalAction(
+        req.user.clientId,
+        req.params.videoId,
+      );
+      if (!found) return res.status(404).json({ error: "Video not found" });
+
+      const { container, video } = found;
+      video.approved = true;
+      video.approvedAt = new Date();
+      video.revision = false;
+      video.revisionNote = "";
+      video.editFase = "client_approved";
+      await container.save();
+      // Notify studio
+      const client = await Client.findById(req.user.clientId);
+      await Note.create({
+        clientId: req.user.clientId,
+        from: "client",
+        author: client?.name || "Client",
+        text: `Goedgekeurd: "${video.name}"`,
+      });
+      return res.json({ message: "Approved", video });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
@@ -2692,28 +2447,28 @@ router.post(
     try {
       const note =
         typeof req.body?.note === "string" ? req.body.note.trim() : "";
-      if (!note) {
-        return res.status(400).json({ error: "Revision note is required" });
-      }
-      const batches = await Batch.find({ clientId: req.user.clientId });
-      for (const batch of batches) {
-        const video = batch.videos.id(req.params.videoId);
-        if (video) {
-          video.revision = true;
-          video.revisionNote = note;
-          video.editFase = "client_revision";
-          await batch.save();
-          const client = await Client.findById(req.user.clientId);
-          await Note.create({
-            clientId: req.user.clientId,
-            from: "client",
-            author: client.name,
-            text: `Revisie voor "${video.name}": ${note}`,
-          });
-          return res.json({ message: "Revision requested", video });
-        }
-      }
-      res.status(404).json({ error: "Video not found" });
+      const revisionNote = note || "Feedback staat in Frame.io.";
+      const found = await findClientVideoForPortalAction(
+        req.user.clientId,
+        req.params.videoId,
+      );
+      if (!found) return res.status(404).json({ error: "Video not found" });
+
+      const { container, video } = found;
+      video.revision = true;
+      video.revisionNote = revisionNote;
+      video.approved = false;
+      video.approvedAt = null;
+      video.editFase = "client_revision";
+      await container.save();
+      const client = await Client.findById(req.user.clientId);
+      await Note.create({
+        clientId: req.user.clientId,
+        from: "client",
+        author: client?.name || "Client",
+        text: `Revisie voor "${video.name}": ${revisionNote}`,
+      });
+      return res.json({ message: "Revision requested", video });
     } catch (e) {
       res.status(500).json({ error: e.message });
     }
