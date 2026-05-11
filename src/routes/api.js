@@ -28,6 +28,11 @@ const TEAM_ALL_ACCESS = {
   roles: ["team"],
   teamAccessLevels: ["admin", "editor"],
 };
+/** Same behavior as legacy `auth(TEAM_ADMIN_ONLY)` — studio admins only. */
+const TEAM_ADMIN_ONLY = {
+  roles: ["team"],
+  teamAccessLevels: ["admin"],
+};
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const TASK_COLUMNS = ["todo", "bezig", "review", "klaar"];
 const BCRYPT_HASH_REGEX = /^\$2[aby]\$\d{2}\$/;
@@ -90,6 +95,99 @@ function buildPortalReviewVideo(video, extra = {}) {
     driveUrl: video.assets || "",
     ...extra,
   };
+}
+
+/** UTC midnight for the calendar day of `value` (Date or ms). */
+function startOfUtcDayMs(value) {
+  const d = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(d.getTime())) return NaN;
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
+}
+
+/** Parse YYYY-MM-DD to UTC ms at start of that day; NaN if invalid. */
+function parseIsoDateOnlyMs(dateStr) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(dateStr ?? "").trim());
+  if (!m) return NaN;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const day = Number(m[3]);
+  const t = Date.UTC(y, mo, day);
+  return Number.isNaN(t) ? NaN : t;
+}
+
+function portalShootStatusFromWorkspace(ws, shootDayMs) {
+  if (ws.shootStatus === "wrapped") return "wrapped";
+  const today = startOfUtcDayMs(Date.now());
+  if (!Number.isNaN(shootDayMs) && shootDayMs >= today) {
+    const daysUntil = Math.round((shootDayMs - today) / 86400000);
+    if (daysUntil <= 7) return "soon";
+  }
+  return "planned";
+}
+
+/** Earliest upcoming shoot (date >= today UTC) among non-completed workspaces. */
+function computePortalNextShootFromWorkspaces(workspaces) {
+  const active = workspaces.filter((w) => w.projectStage !== "completed");
+  const today = startOfUtcDayMs(Date.now());
+  let bestWs = null;
+  let bestDay = Infinity;
+  for (const ws of active) {
+    const dayMs = parseIsoDateOnlyMs(ws.shootDate);
+    if (Number.isNaN(dayMs)) continue;
+    if (dayMs < today) continue;
+    if (dayMs < bestDay) {
+      bestDay = dayMs;
+      bestWs = ws;
+    }
+  }
+  if (!bestWs) return null;
+  const dayMs = parseIsoDateOnlyMs(bestWs.shootDate);
+  const info =
+    typeof bestWs.notes === "string" && bestWs.notes.trim()
+      ? bestWs.notes.trim().slice(0, 280)
+      : undefined;
+  return {
+    name: bestWs.name,
+    date: bestWs.shootDate,
+    location: undefined,
+    info,
+    status: portalShootStatusFromWorkspace(bestWs, dayMs),
+    source: "workspace",
+    workspaceId: bestWs._id,
+    shootTime: bestWs.shootTime || undefined,
+  };
+}
+
+function legacyClientShootPayload(shoot) {
+  if (!shoot || typeof shoot !== "object") return null;
+  const date = shoot.date;
+  if (!date || !String(date).trim()) return null;
+  return {
+    name: shoot.name,
+    date: String(date).trim(),
+    location: shoot.location,
+    info: shoot.info,
+    status: shoot.status || "planned",
+    source: "client",
+  };
+}
+
+function stripPortalVideoDriveFields(video) {
+  if (!video || typeof video !== "object") return video;
+  const next = { ...video };
+  delete next.driveUrl;
+  delete next.assets;
+  return next;
+}
+
+function dedupeReviewVideosById(list) {
+  const map = new Map();
+  for (const v of list) {
+    const id = v && v._id != null ? String(v._id) : null;
+    if (!id) continue;
+    if (!map.has(id)) map.set(id, stripPortalVideoDriveFields(v));
+  }
+  return [...map.values()];
 }
 
 function buildFrameReviewPushText(videoName, frameUrl) {
@@ -244,6 +342,10 @@ function normalizeResourceItem(item = {}) {
     name: typeof item?.name === "string" ? item.name.trim() : "",
     note: typeof item?.note === "string" ? item.note.trim() : "",
     status: typeof item?.status === "string" ? item.status.trim() : "",
+    invoiceNumber:
+      typeof item?.invoiceNumber === "string" ? item.invoiceNumber.trim() : "",
+    invoiceLink:
+      typeof item?.invoiceLink === "string" ? item.invoiceLink.trim() : "",
   };
 }
 
@@ -261,7 +363,27 @@ function isEditorAllowedWorkspaceUpdate(existingWorkspace, payload = {}) {
     "shotlist",
     "moodboard",
     "interview",
+    "rawFootageDisk",
+    "invoice",
   ];
+
+  function resourceItemsEqual(current, next) {
+    if (!next) return false;
+    return (
+      next.name === current.name &&
+      next.note === current.note &&
+      next.status === current.status &&
+      next.invoiceNumber === current.invoiceNumber &&
+      next.invoiceLink === current.invoiceLink
+    );
+  }
+
+  function newResourceItemValid(tab, item) {
+    if (tab === "invoice") {
+      return Boolean(item.invoiceNumber || item.invoiceLink);
+    }
+    return Boolean(item.name);
+  }
 
   return tabs.every((tab) => {
     const currentListRaw = Array.isArray(currentResources[tab])
@@ -274,22 +396,73 @@ function isEditorAllowedWorkspaceUpdate(existingWorkspace, payload = {}) {
     const nextList = nextListRaw.map(normalizeResourceItem);
     if (nextList.length < currentList.length) return false;
     for (let i = 0; i < currentList.length; i += 1) {
-      const current = currentList[i];
-      const next = nextList[i];
-      if (
-        !next ||
-        next.name !== current.name ||
-        next.note !== current.note ||
-        next.status !== current.status
-      ) {
-        return false;
-      }
+      if (!resourceItemsEqual(currentList[i], nextList[i])) return false;
     }
     for (let i = currentList.length; i < nextList.length; i += 1) {
-      if (!nextList[i].name) return false;
+      if (!newResourceItemValid(tab, nextList[i])) return false;
     }
     return true;
   });
+}
+
+function escapeRegExp(str) {
+  return String(str).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalizeEditorName(value) {
+  return typeof value === "string" ? value.trim().toLowerCase() : "";
+}
+
+function isTeamEditor(req) {
+  if (req.user?.role !== "team") return false;
+  const level = String(req.user.teamAccessLevel || "editor")
+    .trim()
+    .toLowerCase();
+  return level === "editor";
+}
+
+function editorAssignedToWorkspace(workspace, editorDisplayName) {
+  const a = normalizeEditorName(workspace?.editor);
+  const b = normalizeEditorName(editorDisplayName);
+  return Boolean(a && b && a === b);
+}
+
+/** Returns false if a response was already sent (403/404). */
+function assertEditorWorkspaceAccess(req, res, workspace) {
+  if (!isTeamEditor(req)) return true;
+  if (!workspace) {
+    res.status(404).json({ error: "Workspace not found" });
+    return false;
+  }
+  if (!editorAssignedToWorkspace(workspace, req.user?.name)) {
+    res.status(403).json({ error: "Insufficient permissions" });
+    return false;
+  }
+  return true;
+}
+
+/** Returns false if a response was already sent (403/404). */
+function assertEditorOwnsTask(req, res, task) {
+  if (!isTeamEditor(req)) return true;
+  if (!task) {
+    res.status(404).json({ error: "Task not found" });
+    return false;
+  }
+  if (
+    normalizeEditorName(task.assignee) !== normalizeEditorName(req.user?.name)
+  ) {
+    res.status(403).json({ error: "Insufficient permissions" });
+    return false;
+  }
+  return true;
+}
+
+function buildEditorAssigneeMongoFilter(req) {
+  const name = typeof req.user?.name === "string" ? req.user.name.trim() : "";
+  if (!name) return { _id: null };
+  return {
+    assignee: new RegExp(`^${escapeRegExp(name)}$`, "i"),
+  };
 }
 
 function safeClientDocumentFilename(name) {
@@ -452,7 +625,7 @@ async function findClientVideoForPortalAction(clientId, videoId) {
 // ═══════════════════════════════════════════════════════════════
 // CLIENTS
 // ═══════════════════════════════════════════════════════════════
-router.get("/clients", auth(["team"]), async (req, res) => {
+router.get("/clients", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
     const clients = await Client.find().sort({ name: 1 });
     res.json(clients.map(sanitizeClient));
@@ -461,7 +634,7 @@ router.get("/clients", auth(["team"]), async (req, res) => {
   }
 });
 
-router.get("/clients/:id", auth(["team"]), async (req, res) => {
+router.get("/clients/:id", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
     const client = await Client.findById(req.params.id);
     if (!client) return res.status(404).json({ error: "Not found" });
@@ -471,7 +644,7 @@ router.get("/clients/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/clients", auth(["team"]), async (req, res) => {
+router.post("/clients", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (!req.body?.name?.trim()) {
       return res.status(400).json({ error: "Client name is required" });
@@ -557,7 +730,7 @@ router.post("/clients", auth(["team"]), async (req, res) => {
   }
 });
 
-router.put("/clients/:id", auth(["team"]), async (req, res) => {
+router.put("/clients/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const existingClient = await Client.findById(req.params.id);
     if (!existingClient) return res.status(404).json({ error: "Not found" });
@@ -720,7 +893,7 @@ router.put("/clients/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.get("/clients/:id/documents", auth(["team"]), async (req, res) => {
+router.get("/clients/:id/documents", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const client = await Client.findById(req.params.id).select("documents");
     if (!client) return res.status(404).json({ error: "Client not found" });
@@ -738,7 +911,7 @@ router.get("/clients/:id/documents", auth(["team"]), async (req, res) => {
 
 router.post(
   "/clients/:id/documents/presign",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const client = await Client.findById(req.params.id).select("_id");
@@ -781,7 +954,7 @@ router.post(
   },
 );
 
-router.post("/clients/:id/documents", auth(["team"]), async (req, res) => {
+router.post("/clients/:id/documents", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const client = await Client.findById(req.params.id);
     if (!client) return res.status(404).json({ error: "Client not found" });
@@ -839,7 +1012,7 @@ router.post("/clients/:id/documents", auth(["team"]), async (req, res) => {
   }
 });
 
-router.delete("/clients/:id", auth(["team"]), async (req, res) => {
+router.delete("/clients/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     await Client.findByIdAndDelete(req.params.id);
     res.json({ message: "Deleted" });
@@ -883,7 +1056,7 @@ router.get("/team", auth(TEAM_ALL_ACCESS), async (req, res) => {
   }
 });
 
-router.post("/team", auth(["team"]), async (req, res) => {
+router.post("/team", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const email = normalizeEmail(req.body?.email);
     const password =
@@ -938,7 +1111,7 @@ router.post("/team", auth(["team"]), async (req, res) => {
   }
 });
 
-router.put("/team/:id", auth(["team"]), async (req, res) => {
+router.put("/team/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid team member id" });
@@ -1013,7 +1186,7 @@ router.put("/team/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.delete("/team/:id", auth(["team"]), async (req, res) => {
+router.delete("/team/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
       return res.status(400).json({ error: "Invalid team member id" });
@@ -1035,7 +1208,7 @@ router.delete("/team/:id", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // EVENTS (Calendar)
 // ═══════════════════════════════════════════════════════════════
-router.get("/events", auth(["team"]), async (req, res) => {
+router.get("/events", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const events = await Event.find()
       .populate("assigneeId", "name initials color teamRole")
@@ -1046,7 +1219,7 @@ router.get("/events", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/events", auth(["team"]), async (req, res) => {
+router.post("/events", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (
       !req.body.assigneeId ||
@@ -1067,7 +1240,7 @@ router.post("/events", auth(["team"]), async (req, res) => {
   }
 });
 
-router.put("/events/:id", auth(["team"]), async (req, res) => {
+router.put("/events/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (
       !req.body.assigneeId ||
@@ -1084,7 +1257,7 @@ router.put("/events/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.delete("/events/:id", auth(["team"]), async (req, res) => {
+router.delete("/events/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     await Event.findByIdAndDelete(req.params.id);
     res.json({ message: "Deleted" });
@@ -1098,10 +1271,14 @@ router.delete("/events/:id", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 router.get("/tasks", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
-    const tasks = await Task.find({
+    const baseFilter = {
       archived: false,
       status: { $ne: "delete" },
-    });
+    };
+    const filter = isTeamEditor(req)
+      ? { ...baseFilter, ...buildEditorAssigneeMongoFilter(req) }
+      : baseFilter;
+    const tasks = await Task.find(filter);
     const sorted = [...tasks].sort((a, b) => {
       const colCmp =
         TASK_COLUMNS.indexOf(a.column || "todo") -
@@ -1121,6 +1298,9 @@ router.get("/tasks/archived", auth(TEAM_ALL_ACCESS), async (req, res) => {
     if (req.query?.clientId) {
       filters.clientId = req.query.clientId;
     }
+    if (isTeamEditor(req)) {
+      Object.assign(filters, buildEditorAssigneeMongoFilter(req));
+    }
     const tasks = await Task.find(filters).sort({ archivedAt: -1 });
     res.json(tasks);
   } catch (e) {
@@ -1128,16 +1308,26 @@ router.get("/tasks/archived", auth(TEAM_ALL_ACCESS), async (req, res) => {
   }
 });
 
-router.post("/tasks", auth(["team"]), async (req, res) => {
+router.post("/tasks", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
-    const clientFields = await resolveTaskClientFields(req.body);
-    const targetColumn = TASK_COLUMNS.includes(req.body?.column)
-      ? req.body.column
+    const body = {
+      ...(req.body && typeof req.body === "object" ? req.body : {}),
+    };
+    if (isTeamEditor(req) && req.user?.name) {
+      body.assignee = req.user.name;
+    }
+    const clientFields = await resolveTaskClientFields(body);
+    const targetColumn = TASK_COLUMNS.includes(body?.column)
+      ? body.column
       : "todo";
+    const assigneeFilter = isTeamEditor(req)
+      ? buildEditorAssigneeMongoFilter(req)
+      : {};
     const lastTaskInColumn = await Task.findOne({
       archived: false,
       status: { $ne: "delete" },
       column: targetColumn,
+      ...assigneeFilter,
     })
       .sort({ sortOrder: -1, createdAt: -1 })
       .select("sortOrder");
@@ -1145,7 +1335,7 @@ router.post("/tasks", auth(["team"]), async (req, res) => {
       ? lastTaskInColumn.sortOrder + 1
       : 1;
     const task = await Task.create({
-      ...req.body,
+      ...body,
       ...clientFields,
       column: targetColumn,
       sortOrder: nextSortOrder,
@@ -1156,7 +1346,7 @@ router.post("/tasks", auth(["team"]), async (req, res) => {
   }
 });
 
-router.patch("/tasks/reorder", auth(["team"]), async (req, res) => {
+router.patch("/tasks/reorder", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
     const { movedTaskId, destinationColumn, columnTaskIds } = req.body || {};
     if (!movedTaskId || !mongoose.Types.ObjectId.isValid(String(movedTaskId))) {
@@ -1178,8 +1368,32 @@ router.patch("/tasks/reorder", auth(["team"]), async (req, res) => {
         .json({ error: "At least one column ordering is required" });
     }
 
-    const movedTask = await Task.findById(movedTaskId).select("_id");
+    const movedTask = await Task.findById(movedTaskId);
     if (!movedTask) return res.status(404).json({ error: "Task not found" });
+    if (!assertEditorOwnsTask(req, res, movedTask)) return;
+
+    if (isTeamEditor(req)) {
+      const allIds = new Set();
+      touchedColumns.forEach(([, ids]) => {
+        ids.forEach((taskId) => {
+          if (mongoose.Types.ObjectId.isValid(String(taskId)))
+            allIds.add(String(taskId));
+        });
+      });
+      if (allIds.size) {
+        const idList = [...allIds].map((id) => new mongoose.Types.ObjectId(id));
+        const touched = await Task.find({ _id: { $in: idList } }).select(
+          "assignee",
+        );
+        const self = normalizeEditorName(req.user?.name);
+        if (
+          touched.length !== allIds.size ||
+          touched.some((t) => normalizeEditorName(t.assignee) !== self)
+        ) {
+          return res.status(403).json({ error: "Insufficient permissions" });
+        }
+      }
+    }
 
     const bulkOps = [];
     touchedColumns.forEach(([column, ids]) => {
@@ -1230,7 +1444,7 @@ router.patch("/tasks/reorder", auth(["team"]), async (req, res) => {
   }
 });
 
-router.patch("/tasks/:id/column", auth(["team"]), async (req, res) => {
+router.patch("/tasks/:id/column", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
     const { column } = req.body || {};
     if (!TASK_COLUMNS.includes(column)) {
@@ -1239,6 +1453,7 @@ router.patch("/tasks/:id/column", auth(["team"]), async (req, res) => {
 
     const task = await Task.findById(req.params.id);
     if (!task) return res.status(404).json({ error: "Task not found" });
+    if (!assertEditorOwnsTask(req, res, task)) return;
 
     if (task.column === column) {
       return res.json(task);
@@ -1259,8 +1474,12 @@ router.patch("/tasks/:id/column", auth(["team"]), async (req, res) => {
   }
 });
 
-router.put("/tasks/:id", auth(["team"]), async (req, res) => {
+router.put("/tasks/:id", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
+    const existing = await Task.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Task not found" });
+    if (!assertEditorOwnsTask(req, res, existing)) return;
+
     const body = req.body && typeof req.body === "object" ? req.body : {};
     if (
       Object.prototype.hasOwnProperty.call(body, "column") &&
@@ -1269,6 +1488,9 @@ router.put("/tasks/:id", auth(["team"]), async (req, res) => {
       return res.status(400).json({ error: "Invalid task column" });
     }
     const updatePayload = { ...body };
+    if (isTeamEditor(req)) {
+      delete updatePayload.assignee;
+    }
     if (Object.prototype.hasOwnProperty.call(body, "description")) {
       updatePayload.description =
         typeof body.description === "string" ? body.description.trim() : "";
@@ -1314,7 +1536,7 @@ router.put("/tasks/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/tasks/:id/archive", auth(["team"]), async (req, res) => {
+router.post("/tasks/:id/archive", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
     const archivedReason =
       typeof req.body?.archivedReason === "string" &&
@@ -1323,6 +1545,9 @@ router.post("/tasks/:id/archive", auth(["team"]), async (req, res) => {
         : typeof req.body?.reason === "string" && req.body.reason.trim()
           ? req.body.reason.trim()
           : "manual";
+
+    const existing = await Task.findById(req.params.id);
+    if (!assertEditorOwnsTask(req, res, existing)) return;
 
     const task = await Task.findByIdAndUpdate(
       req.params.id,
@@ -1346,8 +1571,12 @@ router.post("/tasks/:id/archive", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/tasks/:id/restore", auth(["team"]), async (req, res) => {
+router.post("/tasks/:id/restore", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
+    const existing = await Task.findById(req.params.id);
+    if (!existing) return res.status(404).json({ error: "Task not found" });
+    if (!assertEditorOwnsTask(req, res, existing)) return;
+
     const task = await Task.findByIdAndUpdate(
       req.params.id,
       {
@@ -1368,7 +1597,7 @@ router.post("/tasks/:id/restore", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // WORKSPACE (Batches + Videos)
 // ═══════════════════════════════════════════════════════════════
-router.get("/batches", auth(["team"]), async (req, res) => {
+router.get("/batches", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const batches = await Batch.find().sort({ createdAt: -1 });
     res.json(batches);
@@ -1377,7 +1606,7 @@ router.get("/batches", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/batches", auth(["team"]), async (req, res) => {
+router.post("/batches", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const clientId = await resolveClientIdFromPayload(req.body);
     const batch = await Batch.create({
@@ -1390,7 +1619,7 @@ router.post("/batches", auth(["team"]), async (req, res) => {
   }
 });
 
-router.put("/batches/:id", auth(["team"]), async (req, res) => {
+router.put("/batches/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const clientId = await resolveClientIdFromPayload(req.body);
     const batch = await Batch.findByIdAndUpdate(req.params.id, req.body, {
@@ -1406,7 +1635,7 @@ router.put("/batches/:id", auth(["team"]), async (req, res) => {
   }
 });
 
-router.delete("/batches/:id", auth(["team"]), async (req, res) => {
+router.delete("/batches/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     await Batch.findByIdAndDelete(req.params.id);
     res.json({ message: "Deleted" });
@@ -1416,7 +1645,7 @@ router.delete("/batches/:id", auth(["team"]), async (req, res) => {
 });
 
 // Add video to batch
-router.post("/batches/:id/videos", auth(["team"]), async (req, res) => {
+router.post("/batches/:id/videos", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const batch = await Batch.findById(req.params.id);
     batch.videos.push(normalizeVideoFrameFields(req.body || {}));
@@ -1430,7 +1659,7 @@ router.post("/batches/:id/videos", auth(["team"]), async (req, res) => {
 // Update specific video in batch
 router.put(
   "/batches/:batchId/videos/:videoId",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const batch = await Batch.findById(req.params.batchId);
@@ -1495,7 +1724,7 @@ router.put(
 // Delete video from batch
 router.delete(
   "/batches/:batchId/videos/:videoId",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const batch = await Batch.findById(req.params.batchId);
@@ -1513,14 +1742,52 @@ router.delete(
 // ═══════════════════════════════════════════════════════════════
 router.get("/workspaces", auth(TEAM_ALL_ACCESS), async (req, res) => {
   try {
-    const workspaces = await Workspace.find().sort({ createdAt: -1 });
+    let query = {};
+    if (isTeamEditor(req)) {
+      const name =
+        typeof req.user?.name === "string" ? req.user.name.trim() : "";
+      if (!name) {
+        return res.json([]);
+      }
+      query = { editor: new RegExp(`^${escapeRegExp(name)}$`, "i") };
+    }
+    const archivedParam = String(req.query.archived || "").trim().toLowerCase();
+    const archivedOnly =
+      archivedParam === "1" ||
+      archivedParam === "true" ||
+      archivedParam === "yes";
+    if (archivedOnly) {
+      query.archived = true;
+    } else {
+      query.archived = { $ne: true };
+    }
+    const sort = archivedOnly
+      ? { archivedAt: -1, createdAt: -1 }
+      : { createdAt: -1 };
+    const workspaces = await Workspace.find(query).sort(sort);
     res.json(workspaces);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-router.post("/workspaces", auth(["team"]), async (req, res) => {
+router.get("/workspaces/:id", auth(TEAM_ALL_ACCESS), async (req, res) => {
+  try {
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: "Invalid workspace id" });
+    }
+    const workspace = await Workspace.findById(req.params.id);
+    if (!workspace) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+    if (!assertEditorWorkspaceAccess(req, res, workspace)) return;
+    res.json(workspace);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+router.post("/workspaces", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     if (!req.body?.name?.trim()) {
       return res.status(400).json({ error: "Workspace name is required" });
@@ -1543,7 +1810,8 @@ router.put("/workspaces/:id", auth(TEAM_ALL_ACCESS), async (req, res) => {
     if (!existingWorkspace) {
       return res.status(404).json({ error: "Workspace not found" });
     }
-    if (req.user.teamAccessLevel === "editor") {
+    if (!assertEditorWorkspaceAccess(req, res, existingWorkspace)) return;
+    if (isTeamEditor(req)) {
       const allowed = isEditorAllowedWorkspaceUpdate(
         existingWorkspace,
         req.body,
@@ -1568,7 +1836,7 @@ router.put("/workspaces/:id", auth(TEAM_ALL_ACCESS), async (req, res) => {
   }
 });
 
-router.delete("/workspaces/:id", auth(["team"]), async (req, res) => {
+router.delete("/workspaces/:id", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     await Workspace.findByIdAndDelete(req.params.id);
     res.json({ message: "Deleted" });
@@ -1578,7 +1846,7 @@ router.delete("/workspaces/:id", auth(["team"]), async (req, res) => {
 });
 
 // ── Nested: Batches inside a Workspace ────────────────────────
-router.post("/workspaces/:wsId/batches", auth(["team"]), async (req, res) => {
+router.post("/workspaces/:wsId/batches", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const workspace = await Workspace.findById(req.params.wsId);
     if (!workspace)
@@ -1600,7 +1868,7 @@ router.post("/workspaces/:wsId/batches", auth(["team"]), async (req, res) => {
 
 router.put(
   "/workspaces/:wsId/batches/:bId",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const workspace = await Workspace.findById(req.params.wsId);
@@ -1623,7 +1891,7 @@ router.put(
 
 router.delete(
   "/workspaces/:wsId/batches/:bId",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const workspace = await Workspace.findById(req.params.wsId);
@@ -1641,12 +1909,13 @@ router.delete(
 // ── Nested: Videos inside a Batch inside a Workspace ──────────
 router.post(
   "/workspaces/:wsId/batches/:bId/videos",
-  auth(["team"]),
+  auth(TEAM_ALL_ACCESS),
   async (req, res) => {
     try {
       const workspace = await Workspace.findById(req.params.wsId);
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
+      if (!assertEditorWorkspaceAccess(req, res, workspace)) return;
       const batch = workspace.batches.id(req.params.bId);
       if (!batch) return res.status(404).json({ error: "Batch not found" });
 
@@ -1661,12 +1930,13 @@ router.post(
 
 router.put(
   "/workspaces/:wsId/batches/:bId/videos/:vId",
-  auth(["team"]),
+  auth(TEAM_ALL_ACCESS),
   async (req, res) => {
     try {
       const workspace = await Workspace.findById(req.params.wsId);
       if (!workspace)
         return res.status(404).json({ error: "Workspace not found" });
+      if (!assertEditorWorkspaceAccess(req, res, workspace)) return;
       const batch = workspace.batches.id(req.params.bId);
       if (!batch) return res.status(404).json({ error: "Batch not found" });
       const video = batch.videos.id(req.params.vId);
@@ -1729,7 +1999,7 @@ router.put(
 
 router.delete(
   "/workspaces/:wsId/batches/:bId/videos/:vId",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const workspace = await Workspace.findById(req.params.wsId);
@@ -1751,7 +2021,7 @@ router.delete(
 // ═══════════════════════════════════════════════════════════════
 router.get(
   "/portal/:clientId([0-9a-fA-F]{24})/notes",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const notes = await Note.find({ clientId: req.params.clientId }).sort({
@@ -1766,7 +2036,7 @@ router.get(
 
 router.post(
   "/portal/:clientId([0-9a-fA-F]{24})/notes",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const note = await Note.create({
@@ -1784,7 +2054,7 @@ router.post(
 
 router.post(
   "/portal/:clientId/whatsapp/presign",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const { clientId } = req.params;
@@ -1850,7 +2120,7 @@ router.post(
 
 router.post(
   "/portal/:clientId/whatsapp/messages",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const { clientId } = req.params;
@@ -1955,7 +2225,7 @@ router.post(
 
 router.get(
   "/portal/:clientId/whatsapp/messages",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const { clientId } = req.params;
@@ -1976,7 +2246,7 @@ router.get(
   },
 );
 
-router.get("/portal/:clientId/videos", auth(["team"]), async (req, res) => {
+router.get("/portal/:clientId/videos", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const [batches, workspaces] = await Promise.all([
       Batch.find({ clientId: req.params.clientId }),
@@ -2028,7 +2298,7 @@ router.get("/portal/:clientId/videos", auth(["team"]), async (req, res) => {
 // Backfill/update Frame.io asset mapping for existing videos
 router.post(
   "/portal/frame-assets/backfill",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       const mappings = Array.isArray(req.body?.mappings)
@@ -2102,7 +2372,7 @@ router.post(
   },
 );
 
-router.get("/portal/unread-summary", auth(["team"]), async (req, res) => {
+router.get("/portal/unread-summary", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const rows = await Note.aggregate([
       { $match: { from: "client", read: false } },
@@ -2123,7 +2393,7 @@ router.get("/portal/unread-summary", auth(["team"]), async (req, res) => {
   }
 });
 
-router.get("/portal/activity", auth(["team"]), async (req, res) => {
+router.get("/portal/activity", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const limitRaw = Number.parseInt(String(req.query?.limit ?? "40"), 10);
     const limit = Number.isFinite(limitRaw)
@@ -2269,7 +2539,7 @@ router.get("/portal/activity", auth(["team"]), async (req, res) => {
 // Mark notes as read
 router.post(
   "/portal/:clientId/notes/read",
-  auth(["team"]),
+  auth(TEAM_ADMIN_ONLY),
   async (req, res) => {
     try {
       await Note.updateMany(
@@ -2327,9 +2597,7 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
         });
     });
 
-    const questionnaire = await Questionnaire.findOne({ clientId: client._id });
-    const workspaceArchive = workspaces.map((workspace) => {
-      const videos = [];
+    workspaces.forEach((workspace) => {
       (workspace.batches || []).forEach((batch) => {
         (batch.videos || []).forEach((video) => {
           if (
@@ -2346,36 +2614,72 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
               }),
             );
           }
-          videos.push({
-            ...video.toObject(),
-            frameUrl: getFrameReviewUrl(video),
-            driveUrl: video.assets || "",
-            batchName: batch.name,
-            batchId: batch._id,
-          });
         });
       });
-      videos.sort((a, b) => {
-        const right = new Date(b.updatedAt || b.createdAt || 0).getTime();
-        const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
-        return right - left;
-      });
-      return {
-        _id: workspace._id,
-        name: workspace.name,
-        emoji: workspace.emoji,
-        createdAt: workspace.createdAt,
-        updatedAt: workspace.updatedAt,
-        videos,
-      };
     });
+
+    const questionnaire = await Questionnaire.findOne({ clientId: client._id });
+
+    const workspaceCurrent = workspaces
+      .filter((w) => w.projectStage !== "completed")
+      .map((w) => ({
+        _id: w._id,
+        name: w.name,
+        emoji: w.emoji,
+        projectStage: w.projectStage,
+        shootDate: w.shootDate,
+        shootTime: w.shootTime,
+        shootStatus: w.shootStatus,
+        deadline: w.deadline,
+        updatedAt: w.updatedAt,
+      }));
+
+    const workspaceArchive = workspaces
+      .filter((w) => w.projectStage === "completed")
+      .map((workspace) => {
+        const videos = [];
+        (workspace.batches || []).forEach((batch) => {
+          (batch.videos || []).forEach((video) => {
+            const vo = video.toObject();
+            videos.push({
+              ...vo,
+              frameUrl: getFrameReviewUrl(video),
+              batchName: batch.name,
+              batchId: batch._id,
+            });
+          });
+        });
+        videos.sort((a, b) => {
+          const right = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          return right - left;
+        });
+        return {
+          _id: workspace._id,
+          name: workspace.name,
+          emoji: workspace.emoji,
+          createdAt: workspace.createdAt,
+          updatedAt: workspace.updatedAt,
+          videos,
+        };
+      });
+
+    const reviewVideosDeduped = dedupeReviewVideosById(reviewVideos);
+    const nextShootFromWorkspaces =
+      computePortalNextShootFromWorkspaces(workspaces);
+    const nextShoot =
+      nextShootFromWorkspaces ||
+      legacyClientShootPayload(client.shoot) ||
+      null;
 
     res.json({
       client: { ...client.toObject(), portalPassword: undefined },
       notes,
-      reviewVideos,
+      reviewVideos: reviewVideosDeduped,
       deliveredBatches,
+      workspaceCurrent,
       workspaceArchive,
+      nextShoot,
       questionnaire: questionnaire
         ? {
             submitted: questionnaire.submitted,
@@ -2478,7 +2782,7 @@ router.post(
 // ═══════════════════════════════════════════════════════════════
 // QUESTIONNAIRE
 // ═══════════════════════════════════════════════════════════════
-router.get("/questionnaire/:clientId", auth(["team"]), async (req, res) => {
+router.get("/questionnaire/:clientId", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const q = await Questionnaire.findOne({ clientId: req.params.clientId });
     res.json(q);
@@ -2531,7 +2835,7 @@ router.post("/questionnaire/me", auth(["client"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // ACTIVITY FEED
 // ═══════════════════════════════════════════════════════════════
-router.get("/activity", auth(["team"]), async (req, res) => {
+router.get("/activity", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const activities = await Activity.find().sort({ createdAt: -1 }).limit(20);
     res.json(activities);
@@ -2543,7 +2847,7 @@ router.get("/activity", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // STUDIO PULSE (aggregated stats)
 // ═══════════════════════════════════════════════════════════════
-router.get("/pulse", auth(["team"]), async (req, res) => {
+router.get("/pulse", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const [clients, tasks, archivedTasks, batches, events] = await Promise.all([
       Client.find(),
@@ -2714,7 +3018,7 @@ router.get("/pulse", auth(["team"]), async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // VIDEO CHECKER
 // ═══════════════════════════════════════════════════════════════
-router.post("/checker/analyze", auth(["team"]), async (req, res) => {
+router.post("/checker/analyze", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
     const language = LT_LANG_MAP[req.body?.language] || "nl-NL";
@@ -2776,7 +3080,7 @@ function checkerObjectUrl(bucket, region, key) {
   return `https://${bucket}.s3.${region}.amazonaws.com/${path}`;
 }
 
-router.post("/checker/upload/presign", auth(["team"]), async (req, res) => {
+router.post("/checker/upload/presign", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const aws = readAwsCheckerEnv();
     if (!hasBucketAndRegion(aws)) {
@@ -2817,7 +3121,7 @@ router.post("/checker/upload/presign", auth(["team"]), async (req, res) => {
   }
 });
 
-router.post("/checker/runs", auth(["team"]), async (req, res) => {
+router.post("/checker/runs", auth(TEAM_ADMIN_ONLY), async (req, res) => {
   try {
     const aws = readAwsCheckerEnv();
     if (!hasBucketAndRegion(aws)) {

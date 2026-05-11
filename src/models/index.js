@@ -291,9 +291,11 @@ const VideoSchema = new Schema(
 
 const ResourceItemSchema = new Schema(
   {
-    name: { type: String, required: true },
+    name: { type: String, default: "" },
     note: String,
     status: String,
+    invoiceNumber: String,
+    invoiceLink: String,
   },
   { _id: true },
 );
@@ -306,6 +308,8 @@ const BatchResourcesSchema = new Schema(
     shotlist: [ResourceItemSchema],
     moodboard: [ResourceItemSchema],
     interview: [ResourceItemSchema],
+    rawFootageDisk: [ResourceItemSchema],
+    invoice: [ResourceItemSchema],
   },
   { _id: false },
 );
@@ -390,6 +394,8 @@ const WorkspaceSchema = new Schema(
     links: [{ label: String, url: String }],
     resources: { type: BatchResourcesSchema, default: () => ({}) },
     batches: [WorkspaceBatchSchema],
+    archived: { type: Boolean, default: false },
+    archivedAt: { type: Date, default: null },
   },
   { timestamps: true },
 );

@@ -39,14 +39,24 @@ const auth = (options = []) => (req, res, next) => {
     if (!hasPayloadShape(decoded)) {
       return res.status(401).json({ error: "Invalid token payload" });
     }
-    req.user = decoded;
+    if (decoded.role === "team") {
+      const raw = String(decoded.teamAccessLevel ?? "editor")
+        .trim()
+        .toLowerCase();
+      req.user = {
+        ...decoded,
+        teamAccessLevel: raw === "admin" ? "admin" : "editor",
+      };
+    } else {
+      req.user = decoded;
+    }
     if (roles.length && !roles.includes(decoded.role)) {
       return res.status(403).json({ error: 'Insufficient permissions' });
     }
     if (
-      decoded.role === "team" &&
+      req.user.role === "team" &&
       teamAccessLevels.length &&
-      !teamAccessLevels.includes(decoded.teamAccessLevel)
+      !teamAccessLevels.includes(req.user.teamAccessLevel)
     ) {
       return res.status(403).json({ error: "Insufficient permissions" });
     }
