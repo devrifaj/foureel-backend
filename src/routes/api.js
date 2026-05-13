@@ -180,6 +180,22 @@ function stripPortalVideoDriveFields(video) {
   return next;
 }
 
+/** Minimal client-portal row for workspace batch videos (no sop/shotlist). */
+function buildPortalWorkspaceDeliverable(video, batch) {
+  return stripPortalVideoDriveFields({
+    _id: video._id,
+    name: video.name,
+    editFase: video.editFase,
+    approved: !!video.approved,
+    revision: !!video.revision,
+    revisionNote:
+      typeof video.revisionNote === "string" ? video.revisionNote : "",
+    batchName: batch.name,
+    batchId: batch._id,
+    frameUrl: getFrameReviewUrl(video),
+  });
+}
+
 function dedupeReviewVideosById(list) {
   const map = new Map();
   for (const v of list) {
@@ -2622,17 +2638,26 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
 
     const workspaceCurrent = workspaces
       .filter((w) => w.projectStage !== "completed")
-      .map((w) => ({
-        _id: w._id,
-        name: w.name,
-        emoji: w.emoji,
-        projectStage: w.projectStage,
-        shootDate: w.shootDate,
-        shootTime: w.shootTime,
-        shootStatus: w.shootStatus,
-        deadline: w.deadline,
-        updatedAt: w.updatedAt,
-      }));
+      .map((w) => {
+        const deliverables = [];
+        (w.batches || []).forEach((batch) => {
+          (batch.videos || []).forEach((video) => {
+            deliverables.push(buildPortalWorkspaceDeliverable(video, batch));
+          });
+        });
+        return {
+          _id: w._id,
+          name: w.name,
+          emoji: w.emoji,
+          projectStage: w.projectStage,
+          shootDate: w.shootDate,
+          shootTime: w.shootTime,
+          shootStatus: w.shootStatus,
+          deadline: w.deadline,
+          updatedAt: w.updatedAt,
+          deliverables,
+        };
+      });
 
     const workspaceArchive = workspaces
       .filter((w) => w.projectStage === "completed")
