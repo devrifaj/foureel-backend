@@ -193,6 +193,8 @@ function buildPortalWorkspaceDeliverable(video, batch) {
     batchName: batch.name,
     batchId: batch._id,
     frameUrl: getFrameReviewUrl(video),
+    updatedAt: video.updatedAt,
+    createdAt: video.createdAt,
   });
 }
 
@@ -617,14 +619,8 @@ function sanitizeClient(clientDoc) {
 }
 
 async function findClientVideoForPortalAction(clientId, videoId) {
-  const batches = await Batch.find({ clientId });
-  for (const batch of batches) {
-    const video = batch.videos.id(videoId);
-    if (video) {
-      return { container: batch, video };
-    }
-  }
-
+  // Prefer workspace-embedded videos: the client portal lists workspace deliverables
+  // first; legacy Batch documents are checked after to avoid updating the wrong copy.
   const workspaces = await Workspace.find({ clientId });
   for (const workspace of workspaces) {
     for (const wsBatch of workspace.batches || []) {
@@ -632,6 +628,14 @@ async function findClientVideoForPortalAction(clientId, videoId) {
       if (video) {
         return { container: workspace, video };
       }
+    }
+  }
+
+  const batches = await Batch.find({ clientId });
+  for (const batch of batches) {
+    const video = batch.videos.id(videoId);
+    if (video) {
+      return { container: batch, video };
     }
   }
 
@@ -2645,6 +2649,11 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
             deliverables.push(buildPortalWorkspaceDeliverable(video, batch));
           });
         });
+        deliverables.sort((a, b) => {
+          const right = new Date(b.updatedAt || b.createdAt || 0).getTime();
+          const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          return right - left;
+        });
         return {
           _id: w._id,
           name: w.name,
@@ -2659,22 +2668,47 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
         };
       });
 
+    // Legacy top-level Batch documents (not nested under Workspace) still need a
+    // "current project" card so approved / revision videos remain visible in the portal.
+    const legacyBatchWorkspaceCards = batches
+      .filter((b) => (b.videos || []).length > 0 && b.projectStage !== "completed")
+      .map((b) => {
+        const deliverables = [];
+        (b.videos || []).forEach((video) => {
+          deliverables.push(buildPortalWorkspaceDeliverable(video, b));
+        });
+        deliverables.sort((a, x) => {
+          const right = new Date(x.updatedAt || x.createdAt || 0).getTime();
+          const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          return right - left;
+        });
+        return {
+          _id: `legacyBatch:${String(b._id)}`,
+          name: b.name,
+          emoji: b.emoji || "🎬",
+          projectStage: b.projectStage || "preproduction",
+          shootDate: b.shootDate,
+          shootTime: b.shootTime,
+          shootStatus: b.shootStatus,
+          deadline: b.deadline,
+          updatedAt: b.updatedAt,
+          isLegacyBatch: true,
+          deliverables,
+        };
+      });
+
+    const workspaceCurrentMerged = [...workspaceCurrent, ...legacyBatchWorkspaceCards];
+
     const workspaceArchive = workspaces
       .filter((w) => w.projectStage === "completed")
       .map((workspace) => {
-        const videos = [];
+        const deliverables = [];
         (workspace.batches || []).forEach((batch) => {
           (batch.videos || []).forEach((video) => {
-            const vo = video.toObject();
-            videos.push({
-              ...vo,
-              frameUrl: getFrameReviewUrl(video),
-              batchName: batch.name,
-              batchId: batch._id,
-            });
+            deliverables.push(buildPortalWorkspaceDeliverable(video, batch));
           });
         });
-        videos.sort((a, b) => {
+        deliverables.sort((a, b) => {
           const right = new Date(b.updatedAt || b.createdAt || 0).getTime();
           const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
           return right - left;
@@ -2685,9 +2719,34 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
           emoji: workspace.emoji,
           createdAt: workspace.createdAt,
           updatedAt: workspace.updatedAt,
-          videos,
+          deliverables,
         };
       });
+
+    const legacyArchiveBatchCards = batches
+      .filter((b) => b.projectStage === "completed" && (b.videos || []).length > 0)
+      .map((b) => {
+        const deliverables = [];
+        (b.videos || []).forEach((video) => {
+          deliverables.push(buildPortalWorkspaceDeliverable(video, b));
+        });
+        deliverables.sort((a, x) => {
+          const right = new Date(x.updatedAt || x.createdAt || 0).getTime();
+          const left = new Date(a.updatedAt || a.createdAt || 0).getTime();
+          return right - left;
+        });
+        return {
+          _id: `legacyBatchArchive:${String(b._id)}`,
+          name: b.name,
+          emoji: b.emoji || "🎬",
+          createdAt: b.createdAt,
+          updatedAt: b.updatedAt,
+          isLegacyBatch: true,
+          deliverables,
+        };
+      });
+
+    const workspaceArchiveMerged = [...workspaceArchive, ...legacyArchiveBatchCards];
 
     const reviewVideosDeduped = dedupeReviewVideosById(reviewVideos);
     const nextShootFromWorkspaces =
@@ -2702,8 +2761,8 @@ router.get("/portal/me", auth(["client"]), async (req, res) => {
       notes,
       reviewVideos: reviewVideosDeduped,
       deliveredBatches,
-      workspaceCurrent,
-      workspaceArchive,
+      workspaceCurrent: workspaceCurrentMerged,
+      workspaceArchive: workspaceArchiveMerged,
       nextShoot,
       questionnaire: questionnaire
         ? {
